@@ -1,0 +1,133 @@
+[
+  {
+    "service": "nonary.display/1",
+    "method": "status",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display/1",
+    "method": "snapshot",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {},
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display/1",
+    "method": "enumerate",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {},
+      "optional": {
+        "display": "string",
+        "offset": "integer",
+        "limit": "integer"
+      },
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display/1",
+    "method": "apply",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "configuration": "object"
+      },
+      "optional": {
+        "expected_topology_revision": "string",
+        "expected_mutation_domain_id": "string",
+        "expected_mutation_domain_revision": "integer",
+        "operation_id": "string",
+        "mode_policy": "object",
+        "mode_policies": "array"
+      },
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display/1",
+    "method": "restore",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "lease": "string"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display/1",
+    "method": "recover",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {
+      "required": {
+        "lease": "string"
+      },
+      "optional": {},
+      "allow_extra": false
+    },
+    "response": {
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {},
+      "allow_extra": true
+    },
+    "privilege": "user"
+  }
+]

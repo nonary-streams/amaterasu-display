@@ -1,0 +1,60 @@
+{
+  "placements": [
+    "page",
+    "settings",
+    "application"
+  ],
+  "methods": [
+    {
+      "alias": "host_read",
+      "provider": "amaterasu.nvhttp",
+      "service": "nonary.host-settings/1",
+      "method": "read",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.read",
+      "min_role": "viewer"
+    },
+    {
+      "alias": "host_update",
+      "provider": "amaterasu.nvhttp",
+      "service": "nonary.host-settings/1",
+      "method": "update",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "configuration.write",
+      "min_role": "administrator"
+    },
+    {
+      "alias": "app_read",
+      "provider": "amaterasu.catalog",
+      "service": "nonary.catalog/1",
+      "method": "get",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "catalog.read",
+      "min_role": "viewer"
+    },
+    {
+      "alias": "app_update",
+      "provider": "amaterasu.catalog",
+      "service": "nonary.catalog/1",
+      "method": "update",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "catalog.write",
+      "min_role": "operator"
+    },
+    {
+      "alias": "app_update_provider",
+      "provider": "amaterasu.catalog",
+      "service": "nonary.catalog/1",
+      "method": "update_provider_overrides",
+      "interface_major": 1,
+      "interface_minor": 0,
+      "scope": "catalog.write",
+      "min_role": "operator"
+    }
+  ],
+  "settings_owner": "amaterasu.display"
+}
