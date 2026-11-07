@@ -633,6 +633,11 @@ fn hdr_apply(option: &str, requested: Option<bool>) -> Value {
 }
 #[derive(Default)]
 struct FakePlatform {
+    capture_target_queries: usize,
+    capture_targets_unavailable: bool,
+    drift_capture_target_after: Option<usize>,
+    scoped_readback: bool,
+    scoped_only: bool,
     current_snapshot: Option<Snapshot>,
     prepared_configuration: Option<Configuration>,
     preserving_selected: Vec<String>,
@@ -674,11 +679,59 @@ struct FakePlatform {
     kscreen_restore_calls: usize,
 }
 impl Platform for FakePlatform {
+    fn capture_targets(&mut self) -> DisplayResult<Vec<crate::targets::NativeTarget>> {
+        if self.capture_targets_unavailable {
+            return Err(DisplayError::new(
+                "capture_target_unavailable",
+                "source observation unavailable",
+            ));
+        }
+        self.capture_target_queries += 1;
+        let mut snapshot = self.current_snapshot.clone().unwrap_or_else(snapshot);
+        if self
+            .drift_capture_target_after
+            .is_some_and(|after| self.capture_target_queries >= after)
+        {
+            snapshot.paths[0].refresh.numerator = 75;
+        }
+        snapshot
+            .configuration()?
+            .displays
+            .into_iter()
+            .map(|setting| {
+                let output = format!("exact-test-source:{}", setting.id);
+                crate::targets::NativeTarget::observed(self.name(), setting, "Living room", output)
+            })
+            .collect()
+    }
     fn name(&self) -> &'static str {
         "fake_platform_test_only"
     }
     fn supported(&self) -> bool {
+        !self.scoped_only
+    }
+    fn supports_scoped_composition(&self) -> bool {
         true
+    }
+    fn read_configuration_snapshot(&mut self) -> DisplayResult<Value> {
+        if self.scoped_readback
+            && let Some(baseline) = &self.kscreen_baseline
+        {
+            let displays=baseline.outputs.iter().filter(|output|output.connected && output.enabled).map(|output| {
+                let mode=output.mode.as_ref().unwrap();
+                json!({"id":output.id,"width":mode.width,"height":mode.height,"x":output.position.x,"y":output.position.y,
+                    "refresh":{"numerator":mode.refresh_millihz,"denominator":1000},
+                    "rotation":match output.rotation {1=>"identity",2=>"rotate90",4=>"rotate180",8=>"rotate270",_=>panic!("invalid rotation")},
+                    "hdr_enabled":output.hdr_enabled})
+            }).collect::<Vec<_>>();
+            return Ok(
+                json!({"configuration":{"displays":displays},"topology_revision":baseline.revision()?}),
+            );
+        }
+        let snapshot = self.snapshot()?;
+        Ok(
+            json!({"configuration":snapshot.configuration()?,"topology_revision":snapshot.revision()?}),
+        )
     }
     fn capture_kscreen_snapshot(&mut self) -> DisplayResult<Option<KScreenSnapshot>> {
         self.kscreen_capture_count += 1;
@@ -704,7 +757,11 @@ impl Platform for FakePlatform {
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         baseline.validate()?;
-        configuration.validate()?;
+        if self.scoped_readback {
+            configuration.validate_kscreen(baseline)?;
+        } else {
+            configuration.validate()?;
+        }
         guard()?;
         let mut readback = baseline.clone();
         for display in &configuration.displays {
@@ -724,12 +781,21 @@ impl Platform for FakePlatform {
             if let Some(hdr) = display.hdr_enabled {
                 output.hdr_enabled = Some(hdr);
             }
-            output.mode = Some(KScreenModeSnapshot {
-                id: format!("{}x{}@60", display.width, display.height),
-                width: display.width,
-                height: display.height,
-                refresh_millihz: 60_000,
-            });
+            if !self.scoped_readback
+                || output.mode.as_ref().is_none_or(|mode| {
+                    mode.width != display.width
+                        || mode.height != display.height
+                        || u64::from(mode.refresh_millihz) * u64::from(display.refresh.denominator)
+                            != 1000 * u64::from(display.refresh.numerator)
+                })
+            {
+                output.mode = Some(KScreenModeSnapshot {
+                    id: format!("{}x{}@60", display.width, display.height),
+                    width: display.width,
+                    height: display.height,
+                    refresh_millihz: 60_000,
+                });
+            }
         }
         self.kscreen_baseline = Some(readback);
         if self.kscreen_apply_readback_failure {
@@ -836,7 +902,63 @@ impl Platform for FakePlatform {
             output_technology: 5,
         })
     }
+    fn prepare_scoped_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+    ) -> DisplayResult<()> {
+        let expected = if let Some(target) = primary {
+            baseline.scoped_primary_baseline(target)?
+        } else {
+            baseline.clone()
+        };
+        expected.validate_requested_topology(configuration)
+    }
+    fn apply_scoped_kscreen_snapshot(
+        &mut self,
+        configuration: &Configuration,
+        baseline: &KScreenSnapshot,
+        primary: Option<&str>,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        let expected = if let Some(target) = primary {
+            baseline.scoped_primary_baseline(target)?
+        } else {
+            baseline.clone()
+        };
+        self.apply_kscreen_snapshot(configuration, baseline, guard)?;
+        if primary.is_some() {
+            for output in &mut self.kscreen_baseline.as_mut().unwrap().outputs {
+                let metadata = expected
+                    .outputs
+                    .iter()
+                    .find(|candidate| candidate.id == output.id)
+                    .unwrap();
+                output.priority = metadata.priority;
+                output.primary = metadata.primary;
+            }
+        }
+        if !self
+            .kscreen_baseline
+            .as_ref()
+            .unwrap()
+            .matches_configuration(&expected, configuration)
+        {
+            return Err(
+                DisplayError::new("verification_failed", "scoped fake readback mismatch")
+                    .after_mutation(),
+            );
+        }
+        Ok(())
+    }
     fn snapshot(&mut self) -> DisplayResult<Snapshot> {
+        if self.capture_targets_unavailable {
+            return Err(DisplayError::new(
+                "capture_target_unavailable",
+                "source observation unavailable",
+            ));
+        }
         if let Some(current) = &self.current_snapshot {
             return Ok(current.clone());
         }
@@ -1002,6 +1124,36 @@ impl Platform for FakePlatform {
             self.hdr_mutations += 1;
         }
         self.effects.push("apply");
+        if self.scoped_readback {
+            let mut readback = before.clone();
+            readback.paths.clear();
+            for (index, requested) in configuration.displays.iter().enumerate() {
+                let mut path = before
+                    .paths
+                    .iter()
+                    .find(|path| path.id == requested.id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        let mut path = before.paths[0].clone();
+                        path.id = requested.id.clone();
+                        path.source_name = format!("DISPLAY{}", index + 1);
+                        path.source_address.id = index as u32 + 20;
+                        path.target_address.id = index as u32 + 40;
+                        path
+                    });
+                path.source.width = requested.width;
+                path.source.height = requested.height;
+                path.source.x = requested.x;
+                path.source.y = requested.y;
+                path.refresh = requested.refresh;
+                path.signal.active_width = requested.width;
+                path.signal.active_height = requested.height;
+                path.signal.vertical_sync = requested.refresh;
+                path.hdr_enabled = requested.hdr_enabled.or(path.hdr_enabled);
+                readback.paths.push(path);
+            }
+            self.current_snapshot = Some(readback);
+        }
         if display.hdr_enabled == Some(false) && !was_active && self.hdr_state {
             return Err(
                 DisplayError::new("verification_failed", "new target enabled HDR").after_mutation(),
@@ -1101,6 +1253,9 @@ impl Platform for FakePlatform {
             })
             .collect();
         self.inactive = before.paths[0].id != "monitor.one";
+        if self.scoped_readback {
+            self.current_snapshot = Some(before.clone());
+        }
         Ok(())
     }
 }
@@ -1199,6 +1354,8 @@ fn exact_restore_rejects_changed_path_flags_and_output_technology() {
 
 #[derive(Default)]
 struct State {
+    scoped_verifier_response: Option<Value>,
+    lose_scoped_commit: bool,
     revision: u64,
     journal: Option<Value>,
     fail_save: bool,
@@ -1215,6 +1372,10 @@ impl State {
         caller: &str,
         payload: Value,
     ) -> Value {
+        let native_mutation = !matches!(
+            payload["action"].as_str(),
+            Some("borrow_target" | "release_target")
+        );
         let mut input = Some(payload);
         let mut state_reply = None;
         let mut result = None;
@@ -1223,8 +1384,15 @@ impl State {
                 assert!(serde_json::to_vec(&command).unwrap().len() < 16_384);
                 Ok(match command {
                     Command::Poll {} => input.take().map_or(Response::Pending, |payload| Response::Request { id:7, caller:caller.into(), initiator:"original.initiator".into(), service:SERVICE.into(), payload, remaining_ms:30_000 }),
-                    Command::Request { payload, parent, .. } => {
+                    Command::Request { service, payload, parent, .. } => {
                         assert_eq!(parent, Some(7));
+                        if service == amaterasu_module_sdk::virtual_display::SERVICE {
+                            assert!(matches!(payload["action"].as_str(),Some("verify_owner_target"|"verify_retained_mode")));
+                            assert_eq!(payload["owner"],caller);
+                            state_reply = Some(self.scoped_verifier_response.clone().unwrap_or_else(|| json!({"ok":true,"owned":true,"target_id":"monitor.remote","specification":{"identity":payload["identity"],"name":"Remote Monitor","hdr_enabled":false,"width":1280,"height":720,"refresh_millihz":60000},"active":true})));
+                            return Ok(Response::Accepted {id:20});
+                        }
+                        assert_eq!(service,STATE_SERVICE);
                         assert_eq!(payload["key"], JOURNAL_KEY);
                         state_reply = Some(match payload["action"].as_str().unwrap() {
                             "get" => json!({"ok":true,"revision":self.revision,"found":self.journal.is_some(),"value":self.journal}),
@@ -1244,7 +1412,10 @@ impl State {
                             }
                             action => panic!("unexpected state action {action}"),
                         });
-                        if self.lose_set_acceptance && payload["action"] == "set" {
+                        if self.lose_scoped_commit && payload["action"] == "set" && payload["value"].get("scoped_pending").is_none() {
+                            self.lose_scoped_commit = false;
+                            Response::error("transport_error", "scoped commit accepted but reply lost")
+                        } else if self.lose_set_acceptance && payload["action"] == "set" {
                             self.lose_set_acceptance = false;
                             Response::error("transport_error", "set accepted but reply lost")
                         } else {
@@ -1257,7 +1428,7 @@ impl State {
                     }
                     Command::CheckRequest { request } => {
                         assert_eq!(request, 7);
-                        assert!(self.journal.is_some(), "native effect requires durable journal");
+                        assert!(!native_mutation || self.journal.is_some(), "native effect requires durable journal");
                         if self.deny_guard { Response::error("request_ended", "cancelled at native boundary") } else { Response::Ok }
                     }
                     Command::Complete { payload, .. } => {
@@ -3709,6 +3880,10 @@ fn startup_policy_and_request_validation_prevent_effects() {
 #[test]
 fn expired_native_boundary_keeps_recovery_without_effects() {
     let journal = Journal {
+        normal_active: true,
+        scoped_targets: Vec::new(),
+        scoped_pending: None,
+        scoped_origin_shift: (0, 0),
         owner: "owner".into(),
         lease: "display-0000000000000001".into(),
         snapshot: RecoveryBaseline::Ccd(snapshot()),
@@ -3721,6 +3896,8 @@ fn expired_native_boundary_keeps_recovery_without_effects() {
     let mut pipeline = Pipeline::new(FakePlatform::default(), true);
     pipeline.pending = Some(Pending {
         context: Context {
+            verified_scoped_target: None,
+            inherited_scoped: Vec::new(),
             request: 7,
             caller: "owner".into(),
             deadline: Instant::now(),
@@ -3774,6 +3951,10 @@ fn invalid_journals_and_stale_leases_are_never_overwritten() {
     assert!(pipeline.platform.effects.is_empty());
     state.journal = Some(
         serde_json::to_value(Journal {
+            normal_active: true,
+            scoped_targets: Vec::new(),
+            scoped_pending: None,
+            scoped_origin_shift: (0, 0),
             owner: "owner".into(),
             lease: "current".into(),
             snapshot: RecoveryBaseline::Ccd(snapshot()),
@@ -3808,6 +3989,10 @@ fn versioned_kscreen_journal_roundtrips_without_breaking_legacy_ccd_records() {
     assert_eq!(serde_json::to_value(&legacy).unwrap(), legacy_value);
 
     let journal = Journal {
+        normal_active: true,
+        scoped_targets: Vec::new(),
+        scoped_pending: None,
+        scoped_origin_shift: (0, 0),
         owner: "owner".into(),
         lease: "kscreen-lease".into(),
         snapshot: RecoveryBaseline::KScreen(kscreen_snapshot()),
@@ -4083,6 +4268,10 @@ fn kscreen_apply_readback_mismatch_rolls_back_and_clears_only_after_exact_restor
 #[test]
 fn interrupted_kscreen_lease_holds_on_hotplug_and_readback_failure() {
     let journal = Journal {
+        normal_active: true,
+        scoped_targets: Vec::new(),
+        scoped_pending: None,
+        scoped_origin_shift: (0, 0),
         owner: "owner".into(),
         lease: "display-kscreen-interrupted".into(),
         snapshot: RecoveryBaseline::KScreen(kscreen_snapshot()),
@@ -4194,3 +4383,6 @@ fn physical_domain_tracks_durable_lease_revision_and_rejects_stale_plans() {
         "mutation_domain_changed"
     );
 }
+
+mod scoped;
+mod targets;

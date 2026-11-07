@@ -1,7 +1,9 @@
 # Physical display module
 
 `amaterasu-display` builds the native `cdylib` and an `rlib`. It provides
-`amaterasu.display/1` and calls `amaterasu.state/1`. Both the module and originating
+`amaterasu.display/1` and calls `amaterasu.state/1`. Scoped owned-target operations
+also require the selected `amaterasu.virtual-display/1` provider to verify their
+exact owner and prepared mode. Both the module and originating
 callers require the state call grant because recovery writes retain parent
 request authority. The module has no direct filesystem persistence. Native
 modules are trusted code; API grants are not a native-code sandbox.
@@ -446,3 +448,83 @@ The native implementation was extracted from Amaterasu at
 [the Amaterasu repository](https://github.com/nonary-streams/amaterasu).
 Use the published `codex/core-module-plugins` SDK branch or a later compatible
 checkout for the new UI and operation contracts.
+
+## Existing capture targets
+
+The public SDK's `display::targets` module defines read-only selection and
+caller-owned source references on `amaterasu.display/1`:
+
+- `capture_targets` returns at most sixteen rows containing an opaque `selector`,
+  a display label, readiness, and the observed source mode and HDR state.
+- `resolve_capture_target { selector }` resolves that exact row to a provider-issued
+  capture selector and a semantic capture route. An absent or ambiguous output
+  is an error; resolution never selects a different display.
+- `borrow_target { operation_id, selector, reference_id }` durably protects an
+  existing output before returning its exact capture binding. The broker caller
+  owns the reference. Its output, source mode, HDR state and capture route remain
+  frozen across retries and provider restarts. Native readback after the state
+  write must still match the frozen binding.
+- `release_target { operation_id, selector, reference_id }` retires only that
+  caller's reference. It reports `native_removed: false` and never creates,
+  reconfigures or deletes a physical output.
+
+The journal can retain several authenticated references to one unchanged source.
+Normal display changes must preserve protected sources, and normal restoration
+retains their current exact targets. A shared source cannot be independently
+reconfigured or removed while another reference remains. Releasing a borrowed
+physical target preserves the original normal restoration baseline.
+
+Windows resolves each target against independently reconciled CCD, GDI and DXGI
+observations and checks the complete CCD snapshot again afterward. KScreen
+selection observes the same exact output and topology revision twice. Public
+inventory rows contain no native device paths or operating-system handles.
+These observations establish source selection and display state. The selected
+capture route must separately prove its exact-output capability before consumer
+effects; inventory readiness is not proof of an opened capture or client playback.
+
+## Retained monitor composition
+
+`display::ScopedOperation` exposes target-only composition. `scoped_apply` names
+an exact caller-owned virtual-display identity/reference, a complete target
+setting, an operation ID and the observed topology revision. The display provider
+verifies ownership through the selected virtual-display provider before it
+journals or applies the request. Other outputs retain their mode, scale,
+rotation and HDR state. KScreen geometry uses observed logical footprints.
+
+The optional `primary` flag selects the target by translating the common desktop
+origin and changing the explicit primary priority pair. A nonzero origin change
+returns `target_in_use` while a normal game lease or borrowed source reference is
+held. Session coordination also waits for its known peer captures to retire.
+An independently retained target survives a normal game's display restoration.
+`scoped_release` retires composition ownership and reports `native_removed: false`;
+the virtual-display owner must separately remove its native output and verify
+that operation's result.
+
+For a retained mode change, first prepare the exact transaction through the
+virtual-display SDK. `scoped_reconfigure` additionally names that
+`mode_operation_id`; the display provider verifies its prepared dimensions,
+refresh rate and HDR state before any native change. The virtual-display
+provider independently reads back the result before committing its effective
+mode revision.
+
+After a lost reply or consumer restart,
+`scoped_status { identity, reference_id }` discovers only the authenticated
+caller's exact owned scope. It returns the echoed identity/reference, required
+`reference_owned` proof, nullable `operation_id`, and `pending` flag without
+observing or changing native displays
+or writing state. An absent or foreign scope, or a retained reference whose
+initial placement was verified as not applied, returns a null operation and
+`pending: false`. Only an absent or foreign scope returns `reference_owned: false`;
+an unapplied retained reservation remains owned. Earlier queued operations settle
+before this lookup can prove absence. The SDK's `scoped_status_from_reply` binds
+that result to the
+requested scope. This lookup remains available when broad mutation is disabled;
+it establishes admission only, not placement or source readiness.
+
+With the discovered original operation ID,
+`scoped_reconcile { operation_id, identity, reference_id }` settles only an
+existing caller-owned admission. Observed requested state returns `succeeded`.
+Observed pre-mutation state retires the pending transition as `not_applied`,
+while retaining its target reference. An ambiguous observation keeps the
+recovery fence. Reconciliation never accepts a new configuration or replays an
+unknown native mutation.

@@ -8,6 +8,8 @@ mod pipeline;
 mod platform;
 pub mod refresh_rate_option;
 pub mod resolution_option;
+mod scoped;
+mod targets;
 
 pub use configuration_option::DisplayConfigurationOption;
 pub use hdr_option::DisplayHdrOption;
