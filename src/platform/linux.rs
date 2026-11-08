@@ -9,8 +9,10 @@ use crate::model::{
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{self, Read};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -135,11 +137,12 @@ impl KScreenCommandRunner for SystemKScreenCommandRunner {
             KScreenCommand::Query => KSCREEN_QUERY_TIMEOUT,
             KScreenCommand::Configure(_) => KSCREEN_MUTATION_TIMEOUT,
         };
-        let mut child = Command::new("kscreen-doctor")
+        let child = Command::new("kscreen-doctor")
             .args(&arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .map_err(|error| {
                 DisplayError::new(
@@ -147,89 +150,7 @@ impl KScreenCommandRunner for SystemKScreenCommandRunner {
                     format!("could not start user-session KScreen command: {error}"),
                 )
             })?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| {
-                DisplayError::new("platform_error", "KScreen stdout pipe is unavailable")
-            })
-            .map_err(|error| command_error(command, error))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| {
-                DisplayError::new("platform_error", "KScreen stderr pipe is unavailable")
-            })
-            .map_err(|error| command_error(command, error))?;
-        let stdout_reader = thread::spawn(move || read_bounded_output(stdout));
-        let stderr_reader = thread::spawn(move || read_bounded_output(stderr));
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_reader.join();
-                    let _ = stderr_reader.join();
-                    let failure = DisplayError::new(
-                        "platform_error",
-                        format!("KScreen command wait failed: {error}"),
-                    );
-                    return Err(if matches!(command, KScreenCommand::Configure(_)) {
-                        failure.after_mutation()
-                    } else {
-                        failure
-                    });
-                }
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                let failure = DisplayError::new(
-                    "platform_timeout",
-                    "KScreen command exceeded its bounded deadline",
-                );
-                return Err(if matches!(command, KScreenCommand::Configure(_)) {
-                    failure.after_mutation()
-                } else {
-                    failure
-                });
-            }
-            thread::sleep(Duration::from_millis(10));
-        };
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| DisplayError::new("platform_error", "KScreen stdout reader panicked"))
-            .and_then(|output| {
-                output.map_err(|error| {
-                    DisplayError::new(
-                        "platform_error",
-                        format!("KScreen stdout read failed: {error}"),
-                    )
-                })
-            })
-            .map_err(|error| command_error(command, error))?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| DisplayError::new("platform_error", "KScreen stderr reader panicked"))
-            .and_then(|output| {
-                output.map_err(|error| {
-                    DisplayError::new(
-                        "platform_error",
-                        format!("KScreen stderr read failed: {error}"),
-                    )
-                })
-            })
-            .map_err(|error| command_error(command, error))?;
-        Ok(KScreenCommandOutput {
-            status: status.and_then(|status| status.code()),
-            stdout,
-            stderr,
-        })
+        collect_child_output(child, timeout).map_err(|error| command_error(command, error))
     }
 }
 
@@ -526,19 +447,149 @@ fn query_configuration() -> DisplayResult<Value> {
     query_configuration_with(&mut runner)
 }
 
-fn read_bounded_output(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(MAX_CONFIGURATION_BYTES + 1);
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
+/// Owns the child until it is reaped, including early pipe/setup errors.
+struct ChildGuard {
+    child: Child,
+    process_group: libc::pid_t,
+    status: Option<ExitStatus>,
+    output_complete: bool,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.output_complete {
+            // The command may have exited while one of its descendants still
+            // owns a captured pipe. Reap the whole process group on every
+            // incomplete path so that delayed helpers cannot outlive capture.
+            // SAFETY: process_group is the fresh group created for this child.
+            unsafe { libc::kill(-self.process_group, libc::SIGKILL) };
         }
-        let remaining = (MAX_CONFIGURATION_BYTES + 1).saturating_sub(bytes.len());
-        let retained = count.min(remaining);
-        bytes.extend_from_slice(&buffer[..retained]);
+        if self.status.is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
-    Ok(bytes)
+}
+
+fn set_nonblocking(pipe: &(impl AsRawFd + ?Sized)) -> io::Result<()> {
+    // SAFETY: the descriptor belongs to the live child pipe and fcntl only
+    // reads/updates its status flags for the lifetime of this call.
+    let flags = unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the same live descriptor is used with a valid integer flag set.
+    if unsafe { libc::fcntl(pipe.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Read a bounded batch so a continuously writing descendant cannot prevent
+/// the deadline or the other pipe from being checked.
+#[derive(PartialEq, Eq)]
+enum PipeState {
+    Eof,
+    Empty,
+    Busy,
+}
+
+fn drain_pipe(reader: &mut impl Read, bytes: &mut Vec<u8>) -> io::Result<PipeState> {
+    let mut buffer = [0_u8; 8192];
+    for _ in 0..8 {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(PipeState::Eof),
+            Ok(count) => {
+                let remaining = (MAX_CONFIGURATION_BYTES + 1).saturating_sub(bytes.len());
+                bytes.extend_from_slice(&buffer[..count.min(remaining)]);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(PipeState::Empty),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(PipeState::Busy)
+}
+
+fn collect_child_output(child: Child, timeout: Duration) -> DisplayResult<KScreenCommandOutput> {
+    let process_group = child.id() as libc::pid_t;
+    let mut child = ChildGuard {
+        child,
+        process_group,
+        status: None,
+        output_complete: false,
+    };
+    let mut stdout =
+        child.child.stdout.take().ok_or_else(|| {
+            DisplayError::new("platform_error", "KScreen stdout pipe is unavailable")
+        })?;
+    let mut stderr =
+        child.child.stderr.take().ok_or_else(|| {
+            DisplayError::new("platform_error", "KScreen stderr pipe is unavailable")
+        })?;
+    for pipe in [&stdout as &dyn AsRawFd, &stderr as &dyn AsRawFd] {
+        set_nonblocking(pipe).map_err(|error| {
+            DisplayError::new(
+                "platform_error",
+                format!("KScreen pipe setup failed: {error}"),
+            )
+        })?;
+    }
+    let mut output = Vec::new();
+    let mut errors = Vec::new();
+    let deadline = Instant::now() + timeout;
+    loop {
+        // Observe exit before draining so all of the child's writes are
+        // visible when a pipe next reports WouldBlock or EOF.
+        if child.status.is_none() {
+            child.status = child.child.try_wait().map_err(|error| {
+                DisplayError::new(
+                    "platform_error",
+                    format!("KScreen command wait failed: {error}"),
+                )
+            })?;
+        }
+        let stdout_state = drain_pipe(&mut stdout, &mut output).map_err(|error| {
+            DisplayError::new(
+                "platform_error",
+                format!("KScreen stdout read failed: {error}"),
+            )
+        })?;
+        let stderr_state = drain_pipe(&mut stderr, &mut errors).map_err(|error| {
+            DisplayError::new(
+                "platform_error",
+                format!("KScreen stderr read failed: {error}"),
+            )
+        })?;
+        if let Some(status) = child.status {
+            if stdout_state == PipeState::Eof && stderr_state == PipeState::Eof {
+                child.output_complete = true;
+                return Ok(KScreenCommandOutput {
+                    status: status.code(),
+                    stdout: output,
+                    stderr: errors,
+                });
+            }
+            if stdout_state == PipeState::Empty || stderr_state == PipeState::Empty {
+                // A descendant still holds a pipe and may write later. Its
+                // output and any mutation are unconfirmed; never infer
+                // success from the direct child's exit status alone.
+                return Err(DisplayError::new(
+                    "platform_error",
+                    "KScreen output pipe remained open after the command exited",
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(DisplayError::new(
+                "platform_timeout",
+                "KScreen command exceeded its bounded deadline",
+            ));
+        }
+        if stdout_state != PipeState::Busy && stderr_state != PipeState::Busy {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 fn query_configuration_with(runner: &mut impl KScreenCommandRunner) -> DisplayResult<Value> {

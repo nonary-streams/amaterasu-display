@@ -1,5 +1,68 @@
 use super::*;
 
+fn child_with_pipes(script: &str) -> Child {
+    Command::new("/bin/sh")
+        .args(["-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn command_collection_does_not_wait_for_descendants_holding_pipes() {
+    let child = child_with_pipes("(sleep 2; printf 'applying config failed' >&2) & printf stdout");
+    let start = Instant::now();
+    let error = collect_child_output(child, Duration::from_secs(1)).unwrap_err();
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(error.code, "platform_error");
+    assert!(error.message.contains("pipe remained open"));
+    assert!(command_error(&KScreenCommand::Configure(vec![]), error).may_have_changed);
+}
+
+#[test]
+fn command_collection_kills_descendants_that_keep_pipes_open() {
+    let marker = std::env::temp_dir().join(format!(
+        "amaterasu-display-descendant-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let quoted_marker = format!("'{}'", marker.to_string_lossy().replace('\'', "'\\''"));
+    let script = format!("(sleep 0.15; printf leaked > {quoted_marker}) & printf stdout");
+    let error =
+        collect_child_output(child_with_pipes(&script), Duration::from_secs(1)).unwrap_err();
+    assert!(error.message.contains("pipe remained open"));
+    thread::sleep(Duration::from_millis(300));
+    let descendant_ran = marker.exists();
+    let _ = std::fs::remove_file(marker);
+    assert!(!descendant_ran, "a descendant outlived command collection");
+}
+
+#[test]
+fn command_collection_bounds_output_and_drains_both_pipes() {
+    let child = child_with_pipes("head -c 1100000 /dev/zero; head -c 1100000 /dev/zero >&2");
+    let output = collect_child_output(child, Duration::from_secs(5)).unwrap();
+    assert_eq!(output.status, Some(0));
+    assert_eq!(output.stdout.len(), MAX_CONFIGURATION_BYTES + 1);
+    assert_eq!(output.stderr.len(), MAX_CONFIGURATION_BYTES + 1);
+}
+
+#[test]
+fn command_collection_enforces_deadline_for_a_live_child() {
+    // The background child retains both pipes after the foreground child is
+    // killed, so timeout must not wait for pipe EOF either.
+    let child = child_with_pipes("sleep 2 & exec sleep 5");
+    let start = Instant::now();
+    let error = collect_child_output(child, Duration::from_millis(50)).unwrap_err();
+    assert_eq!(error.code, "platform_timeout");
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+
 fn mode(id: &str, width: u32, height: u32, refresh_rate: f64) -> Value {
     json!({
         "id": id,
