@@ -708,7 +708,19 @@ fn apply_scoped_kscreen_snapshot_with(
         ));
     }
     let actions = scoped_apply_actions(configuration, &final_raw, baseline, primary)?;
-    run_configuration_with(runner, actions)?;
+    let mut before_hdr = configuration.clone();
+    for display in &mut before_hdr.displays {
+        if display.hdr_enabled == Some(true) {
+            display.hdr_enabled = final_snapshot
+                .outputs
+                .iter()
+                .find(|output| output.id.eq_ignore_ascii_case(&display.id))
+                .and_then(|output| output.hdr_enabled);
+        }
+    }
+    configure_before_hdr_activation(runner, actions, guard, |observed| {
+        observed.matches_configuration(&expected, &before_hdr)
+    })?;
     let after = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
     let after_outputs = validated_outputs(&after).map_err(DisplayError::after_mutation)?;
     let after = typed_snapshot(&after_outputs).map_err(DisplayError::after_mutation)?;
@@ -750,7 +762,22 @@ fn restore_kscreen_snapshot_with(
         return Ok(());
     }
     let actions = restoration_actions(baseline, &final_raw)?;
-    run_configuration_with(runner, actions)?;
+    let mut before_hdr = baseline.clone();
+    for output in &mut before_hdr.outputs {
+        if actions.iter().any(|action| {
+            matches!(action, KScreenAction::Hdr { output: name, enabled: true }
+                if name.eq_ignore_ascii_case(&output.id))
+        }) {
+            output.hdr_enabled = final_snapshot
+                .outputs
+                .iter()
+                .find(|present| present.id.eq_ignore_ascii_case(&output.id))
+                .and_then(|present| present.hdr_enabled);
+        }
+    }
+    configure_before_hdr_activation(runner, actions, guard, |observed| {
+        before_hdr.matches_restoration(observed)
+    })?;
     let after = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
     let after_outputs = validated_outputs(&after).map_err(DisplayError::after_mutation)?;
     let after = typed_snapshot(&after_outputs).map_err(DisplayError::after_mutation)?;
@@ -762,6 +789,36 @@ fn restore_kscreen_snapshot_with(
         .after_mutation());
     }
     Ok(())
+}
+
+/// KWin can discard an HDR activation issued in the same transaction as a
+/// modeset. Observe the complete intermediate geometry before enabling HDR in
+/// its own transaction; every failure after the first effect retains recovery.
+fn configure_before_hdr_activation(
+    runner: &mut impl KScreenCommandRunner,
+    actions: Vec<KScreenAction>,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+    geometry_matches: impl FnOnce(&KScreenSnapshot) -> bool,
+) -> DisplayResult<()> {
+    let (hdr_activation, geometry): (Vec<_>, Vec<_>) = actions
+        .into_iter()
+        .partition(|action| matches!(action, KScreenAction::Hdr { enabled: true, .. }));
+    run_configuration_with(runner, geometry)?;
+    if hdr_activation.is_empty() {
+        return Ok(());
+    }
+    let current = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
+    let outputs = validated_outputs(&current).map_err(DisplayError::after_mutation)?;
+    let observed = typed_snapshot(&outputs).map_err(DisplayError::after_mutation)?;
+    if !geometry_matches(&observed) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "KScreen mode and geometry did not settle before HDR activation",
+        )
+        .after_mutation());
+    }
+    guard().map_err(DisplayError::after_mutation)?;
+    run_configuration_with(runner, hdr_activation)
 }
 
 fn enumeration_rows(configuration: &Value, display: Option<&str>) -> DisplayResult<Vec<Value>> {
@@ -1436,7 +1493,11 @@ fn apply_actions(
                     "KScreen HDR state must be readable before it can be changed",
                 )
             })?;
-            if current_hdr != requested_hdr {
+            // A modeset can leave KScreen reporting true from the old color
+            // pipeline. Reapply HDR-on in its separate transaction in that case.
+            if current_hdr != requested_hdr
+                || (requested_hdr && !mode_timing_matches(current_mode, &requested)?)
+            {
                 actions.push(KScreenAction::Hdr {
                     output: output_name(output)?.to_owned(),
                     enabled: requested_hdr,
@@ -1511,10 +1572,15 @@ fn append_output_restoration(
         saved.hdr_enabled,
         present.get("hdr").and_then(Value::as_bool),
     ) {
-        (Some(expected), Some(actual)) if expected != actual => actions.push(KScreenAction::Hdr {
-            output,
-            enabled: expected,
-        }),
+        (Some(expected), Some(actual))
+            if expected != actual
+                || (expected && !mode_timing_matches(current_mode, saved_mode)?) =>
+        {
+            actions.push(KScreenAction::Hdr {
+                output,
+                enabled: expected,
+            })
+        }
         (Some(_), Some(_)) | (None, None) => {}
         _ => {
             return Err(DisplayError::new(

@@ -573,6 +573,152 @@ fn hdr_source_apply_and_restore_are_readback_verified() {
 }
 
 #[test]
+fn hdr_activation_follows_verified_modeset_and_reapplies_existing_true_state() {
+    for initially_enabled in [false, true] {
+        let mut raw = configuration();
+        raw["outputs"][0]["hdr"] = json!(initially_enabled);
+        let baseline = typed_snapshot_for(&raw);
+        let request: Configuration = serde_json::from_value(json!({
+            "displays": [{
+                "id":"DP-1", "width":1280, "height":720,
+                "refresh":{"numerator":60,"denominator":1}, "x":0,"y":0,
+                "hdr_enabled":true
+            }]
+        }))
+        .unwrap();
+        let mut runner = FakeKScreenRunner {
+            current: Some(raw),
+            ..Default::default()
+        };
+        apply_kscreen_snapshot_with(&mut runner, &request, &baseline, &mut || Ok(())).unwrap();
+        let transactions: Vec<_> = runner
+            .commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| {
+                if let KScreenCommand::Configure(actions) = command {
+                    Some((index, actions))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(transactions.len(), 2);
+        assert!(
+            transactions[0]
+                .1
+                .iter()
+                .any(|action| matches!(action, KScreenAction::Mode { .. }))
+        );
+        assert!(
+            transactions[0]
+                .1
+                .iter()
+                .all(|action| !matches!(action, KScreenAction::Hdr { enabled: true, .. }))
+        );
+        assert_eq!(
+            transactions[1].1,
+            &vec![KScreenAction::Hdr {
+                output: "DP-1".into(),
+                enabled: true
+            }]
+        );
+        assert!(
+            runner.commands[transactions[0].0 + 1..transactions[1].0]
+                .iter()
+                .any(|command| matches!(command, KScreenCommand::Query))
+        );
+        assert!(
+            typed_snapshot_for(runner.current.as_ref().unwrap())
+                .matches_configuration(&baseline, &request)
+        );
+    }
+}
+
+#[test]
+fn hdr_is_not_activated_when_modeset_readback_or_late_authorization_fails() {
+    let raw = configuration();
+    let baseline = typed_snapshot_for(&raw);
+    let request: Configuration = serde_json::from_value(json!({
+        "displays": [{
+            "id":"DP-1", "width":1280, "height":720,
+            "refresh":{"numerator":60,"denominator":1}, "x":0,"y":0,
+            "hdr_enabled":true
+        }]
+    }))
+    .unwrap();
+    for ignore_geometry in [false, true] {
+        let mut runner = FakeKScreenRunner {
+            current: Some(raw.clone()),
+            ignore_configuration: ignore_geometry,
+            ..Default::default()
+        };
+        let mut guards = 0;
+        let error = apply_kscreen_snapshot_with(&mut runner, &request, &baseline, &mut || {
+            guards += 1;
+            if guards == 3 {
+                Err(DisplayError::new("cancelled", "lease was withdrawn"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert!(error.may_have_changed);
+        assert_eq!(
+            error.code,
+            if ignore_geometry {
+                "verification_failed"
+            } else {
+                "cancelled"
+            }
+        );
+        assert!(!runner.commands.iter().any(|command| matches!(command,
+            KScreenCommand::Configure(actions) if actions.iter().any(|action| matches!(action, KScreenAction::Hdr { enabled:true, .. }))
+        )));
+    }
+}
+
+#[test]
+fn hdr_restoration_uses_separate_transaction_after_restoring_mode() {
+    let mut saved = configuration();
+    saved["outputs"][0]["hdr"] = json!(true);
+    let baseline = typed_snapshot_for(&saved);
+    let mut raw = saved.clone();
+    raw["outputs"][0]["currentModeId"] = json!("1280x720@60");
+    raw["outputs"][0]["hdr"] = json!(false);
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    restore_kscreen_snapshot_with(&mut runner, &baseline, &mut || Ok(())).unwrap();
+    let transactions: Vec<_> = runner
+        .commands
+        .iter()
+        .filter_map(|command| {
+            if let KScreenCommand::Configure(actions) = command {
+                Some(actions)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(transactions.len(), 2);
+    assert!(
+        transactions[0]
+            .iter()
+            .any(|action| matches!(action, KScreenAction::Mode { .. }))
+    );
+    assert_eq!(
+        transactions[1],
+        &vec![KScreenAction::Hdr {
+            output: "DP-1".into(),
+            enabled: true
+        }]
+    );
+    assert!(baseline.matches_restoration(&typed_snapshot_for(runner.current.as_ref().unwrap())));
+}
+
+#[test]
 fn hdr_source_change_rejects_unreadable_baseline_before_mutation() {
     let mut raw = configuration();
     raw["outputs"][0].as_object_mut().unwrap().remove("hdr");
@@ -627,7 +773,10 @@ fn restore_is_readback_verified_idempotent_and_never_toggles_last_active_output(
         .iter()
         .filter(|command| matches!(command, KScreenCommand::Configure(_)))
         .count();
-    assert_eq!(configure_count, 1);
+    assert_eq!(
+        configure_count, 2,
+        "mode restoration precedes HDR activation"
+    );
     if let Some(KScreenCommand::Configure(actions)) = runner
         .commands
         .iter()
@@ -688,8 +837,8 @@ fn interrupted_restore_retry_from_a_new_runner_completes_the_durable_baseline() 
             .iter()
             .filter(|command| matches!(command, KScreenCommand::Configure(_)))
             .count(),
-        1,
-        "restart retry should apply only the remaining restoration state",
+        2,
+        "restart retry restores remaining geometry before activating HDR",
     );
 }
 
