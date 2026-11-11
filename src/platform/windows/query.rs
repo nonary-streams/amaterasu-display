@@ -183,10 +183,16 @@ pub fn verify_newly_active_hdr_is_off(route: &RouteBinding) -> DisplayResult<()>
             "newly active HDR route changed",
         ));
     }
-    if advanced_color_enabled(path)? != Some(false) {
+    verify_newly_active_sdr_state(advanced_color_enabled(path))
+}
+
+fn verify_newly_active_sdr_state(observed: DisplayResult<Option<bool>>) -> DisplayResult<()> {
+    // None means HDR is unsupported, rather than a failed observation. A target
+    // without HDR controls is already SDR; native query failures remain errors.
+    if observed? == Some(true) {
         return Err(DisplayError::new(
             "verification_failed",
-            "newly active target has HDR enabled or an unknown HDR baseline",
+            "newly active target has HDR enabled without a saved HDR baseline",
         ));
     }
     Ok(())
@@ -927,6 +933,27 @@ mod tests {
         .unwrap_err();
         assert_eq!(query_error.code, "topology_changed");
         assert!(query_error.may_have_changed);
+    }
+
+    #[test]
+    fn newly_active_sdr_only_target_does_not_require_hdr_controls() {
+        super::verify_newly_active_sdr_state(Ok(None)).unwrap();
+        super::verify_newly_active_sdr_state(Ok(Some(false))).unwrap();
+        assert_eq!(
+            super::verify_newly_active_sdr_state(Ok(Some(true)))
+                .unwrap_err()
+                .code,
+            "verification_failed",
+        );
+        assert_eq!(
+            super::verify_newly_active_sdr_state(Err(DisplayError::new(
+                "platform_error",
+                "native HDR query failed",
+            )))
+            .unwrap_err()
+            .code,
+            "platform_error",
+        );
     }
 
     #[test]
