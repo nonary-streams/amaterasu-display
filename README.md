@@ -15,42 +15,48 @@ Startup settings default to read-only:
 ```
 
 An administrator must explicitly enable `allow_mutation` before apply, restore,
-or recover. Windows has a native CCD implementation. Linux/KDE has read-only
-session enumeration and configuration snapshots; physical display mutation and
-macOS display operations remain unsupported.
+or recover. Windows uses native CCD transactions and Linux/KDE uses journaled
+KScreen transactions. macOS display operations remain unsupported. The broker
+provider runs on the SDK's serialized service worker, so native observation,
+mode changes and restoration never wait on the shared host tick.
 
-## Linux/KDE read-only discovery
+## Linux/KDE display transactions
 
 Linux `enumerate` and `snapshot` query `kscreen-doctor -j` from the module's
-existing user session. The query requires that session's
-`DBUS_SESSION_BUS_ADDRESS` and absolute `XDG_RUNTIME_DIR`; it never invokes a
-shell, requests elevation, or performs a display mutation. Snapshot responses
-include normalized active `Configuration` rows, a topology revision, and the
-validated KScreen output state needed to preserve session settings such as
-scale, rotation, HDR state, priority, and exact mode identity.
+existing user session. That session must supply `DBUS_SESSION_BUS_ADDRESS`, an
+absolute `XDG_RUNTIME_DIR`, and its matching Qt/Wayland display environment.
+Commands use direct arguments, bounded output and deadlines. Discovery is
+read-only and never requests elevation.
 
-`native_supported` remains false for Linux mutations. The provider now contains
-a bounded, direct-argv KScreen apply/restore transaction behind that capability
-gate. It resolves journaled connector names against fresh session output state,
-rejects changed connector or enabled-output sets, selects only a unique saved
-mode (or the exact saved mode ID), and verifies a fresh post-command snapshot.
-It never enables or disables outputs, so this slice cannot turn off the last
-active display. Command timeout, KScreen rejection, and readback uncertainty
-are marked as possible mutations so the existing pipeline retains its recovery
-journal. Fake-runner fixtures cover argument construction, apply/readback,
-restoration, idempotency, hotplug, ambiguous modes, timeouts, and rejection.
-The journal's untagged `snapshot`
-baseline preserves legacy CCD JSON exactly while allowing a version-1 KScreen-
-only object. That payload preserves connector identity, mode timing and ID,
-position, scale, rotation, enabled/connected and primary state, priority, and
-optional HDR state.
-The existing pipeline captures and rechecks provider-specific KScreen state
-around journal preparation, then persists it through the state revision-CAS
-boundary before native effects. Restore and rollback verify KScreen readback
-before they clear the journal. Linux remains `native_supported:false`, so the
-pipeline cannot reach these operations yet. Central review and qualification
-are still required before enabling the capability. This does not qualify
-KScreen, Plasma, or any virtual-output driver for runtime use.
+Normal physical leases support changing resolution, refresh, rotation and HDR,
+activating a connected inactive output, selecting the primary display, and
+retiring unselected outputs. They preserve the full connected physical baseline,
+including disabled monitors, exact mode timing, position, scale, rotation,
+priority and color state. Hardware identity comes from a bounded KScreen UUID
+when available, otherwise a unique connected canonical DRM connector and its
+bounded EDID digest. Missing or changed identity holds the transaction before
+native effects. Legacy journals without sufficient identity remain available
+for inspection and recovery rather than authorizing guessed physical changes.
+
+Every desired survivor is activated and independently observed before any
+previous scanout is disabled. HDR activation follows verified mode and geometry
+in a separate transaction. Restore and rollback verify the saved complete
+physical configuration before clearing the journal. Command rejection,
+timeout, partial readback or lost authorization retains recovery evidence.
+Scoped owned-target operations retain their narrower active-output ownership
+and restoration rules.
+
+General physical transactions conservatively reject inventories containing
+`Virtual-*` connectors, including legacy mixed baselines. Those outputs belong
+to their provider's streaming lifecycle and must not be recreated or removed
+from a physical desktop journal. Safe mixed physical/managed-virtual composition
+and physical clone layouts remain implementation gaps.
+
+`native_supported:true` reports the implemented Linux backend, while
+`allow_mutation` remains separately controlled and defaults to false. Fake
+command runners qualify transaction order, readback, cancellation, hotplug,
+monitor replacement and recovery; they do not establish actual KScreen/Plasma,
+Windows driver, display hardware or client playback qualification.
 
 ## Refresh-rate option model
 
