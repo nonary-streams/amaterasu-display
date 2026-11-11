@@ -1,5 +1,6 @@
 mod apply;
 mod conversion;
+mod hdr_control;
 mod query;
 
 use super::Platform;

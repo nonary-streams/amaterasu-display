@@ -125,42 +125,9 @@ pub fn names(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<DeviceNames> {
     })
 }
 
-/// Returns None when the target has no advanced-color control. The bitfield's
-/// support and enabled bits are distinct; support alone must not imply HDR.
+/// Read HDR independently from SDR wide-color management on recent Windows.
 pub fn advanced_color_enabled(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<Option<bool>> {
-    let mut packet = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO {
-        header: device_header(
-            DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO,
-            std::mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>(),
-            path.targetInfo.adapterId,
-            path.targetInfo.id,
-        ),
-        ..Default::default()
-    };
-    // SAFETY: the initialized packet owns the output storage described by header.
-    let result = unsafe { DisplayConfigGetDeviceInfo(&mut packet.header) };
-    if result == ERROR_NOT_SUPPORTED as i32 {
-        return Ok(None);
-    }
-    check(result, "DisplayConfigGetDeviceInfo(advanced color)")?;
-    // SAFETY: value is the documented raw bitfield view of this initialized union.
-    decode_advanced_color_flags(unsafe { packet.Anonymous.value })
-}
-
-fn decode_advanced_color_flags(flags: u32) -> DisplayResult<Option<bool>> {
-    if flags & 4 != 0 {
-        return Err(DisplayError::new(
-            "unsupported_display",
-            "wide-color-gamut state cannot be restored by the HDR recovery journal",
-        ));
-    }
-    if flags & 2 != 0 && flags & 1 == 0 {
-        return Err(DisplayError::new(
-            "platform_error",
-            "advanced color is enabled without reported target support",
-        ));
-    }
-    Ok((flags & 1 != 0).then_some(flags & 2 != 0))
+    super::hdr_control::read(path)
 }
 
 pub fn check_legacy_hdr_recovery(snapshot: &Snapshot) -> DisplayResult<()> {
@@ -333,7 +300,6 @@ pub fn set_advanced_color(saved: &DisplayPath, enabled: bool) -> DisplayResult<(
     let write_source = address(path.sourceInfo.adapterId, path.sourceInfo.id);
     let write_source_name = names(path)?.source;
     match advanced_color_enabled(path)? {
-        Some(current) if current == enabled => return Ok(()),
         Some(_) => {}
         None if !enabled => return Ok(()),
         None => {
@@ -343,23 +309,9 @@ pub fn set_advanced_color(saved: &DisplayPath, enabled: bool) -> DisplayResult<(
             ));
         }
     }
-    let packet = DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE {
-        header: device_header(
-            DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_STATE,
-            std::mem::size_of::<DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE>(),
-            path.targetInfo.adapterId,
-            path.targetInfo.id,
-        ),
-        Anonymous: DISPLAYCONFIG_SET_ADVANCED_COLOR_STATE_0 {
-            value: u32::from(enabled),
-        },
-    };
-    // SAFETY: the initialized repr(C) packet owns the input bytes described by
-    // its header; Windows consumes them synchronously and retains no pointer.
-    check(
-        unsafe { DisplayConfigSetDeviceInfo(&packet.header) },
-        "DisplayConfigSetDeviceInfo(advanced color)",
-    )?;
+    // Reapply even when readback already reports the requested state: topology
+    // changes can leave a stale query result while the target still needs its HDR write.
+    super::hdr_control::write(path, enabled)?;
     settle_advanced_color(
         &saved.target_address,
         saved.output_technology,
@@ -704,8 +656,8 @@ pub fn check(code: i32, operation: &str) -> DisplayResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdvancedColorReadback, HDR_SETTLE_ATTEMPTS, decode_advanced_color_flags,
-        settle_advanced_color, verify_advanced_color_route,
+        AdvancedColorReadback, HDR_SETTLE_ATTEMPTS, settle_advanced_color,
+        verify_advanced_color_route,
     };
     use crate::model::{Address, DisplayError};
 
@@ -975,15 +927,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(query_error.code, "topology_changed");
         assert!(query_error.may_have_changed);
-    }
-
-    #[test]
-    fn advanced_color_support_and_enablement_bits_are_distinct() {
-        assert_eq!(decode_advanced_color_flags(0).unwrap(), None);
-        assert_eq!(decode_advanced_color_flags(1).unwrap(), Some(false));
-        assert_eq!(decode_advanced_color_flags(3).unwrap(), Some(true));
-        assert!(decode_advanced_color_flags(2).is_err());
-        assert!(decode_advanced_color_flags(5).is_err());
     }
 
     #[test]
