@@ -750,7 +750,7 @@ impl Platform for FakePlatform {
         configuration: &Configuration,
         baseline: &KScreenSnapshot,
     ) -> DisplayResult<()> {
-        baseline.validate_requested_topology(configuration)
+        baseline.validate_topology_configuration(configuration)
     }
     fn apply_kscreen_snapshot(
         &mut self,
@@ -762,10 +762,14 @@ impl Platform for FakePlatform {
         if self.scoped_readback {
             configuration.validate_kscreen(baseline)?;
         } else {
-            configuration.validate()?;
+            baseline.validate_topology_configuration(configuration)?;
         }
         guard()?;
-        let mut readback = baseline.clone();
+        let mut readback = if self.scoped_readback {
+            baseline.clone()
+        } else {
+            baseline.configured_topology(configuration)?
+        };
         for display in &configuration.displays {
             let output = readback
                 .outputs
@@ -795,7 +799,10 @@ impl Platform for FakePlatform {
                     id: format!("{}x{}@60", display.width, display.height),
                     width: display.width,
                     height: display.height,
-                    refresh_millihz: 60_000,
+                    refresh_millihz: ((u64::from(display.refresh.numerator) * 1000
+                        + u64::from(display.refresh.denominator) / 2)
+                        / u64::from(display.refresh.denominator))
+                        as u32,
                 });
             }
         }
@@ -4277,6 +4284,216 @@ fn kscreen_baseline_is_persisted_and_apply_retry_is_idempotent() {
     assert_eq!(retry["applied"], false, "{retry}");
     assert_eq!(retry["lease"], applied["lease"]);
     assert_eq!(pipeline.platform.effects, ["apply_kscreen"]);
+}
+
+fn kscreen_policy(target: &str, option: &str) -> ModePolicy {
+    serde_json::from_value(json!({
+        "display_id":target,"configuration_option":option,"remapping":{},
+        "context":{"resolution_is_automatic":true,"refresh_rate_is_automatic":true,
+            "client_display_mode_override":false,"optimize_game_settings":false}
+    }))
+    .unwrap()
+}
+
+#[test]
+fn kscreen_policy_applies_manual_resolution_without_client_optimization() {
+    let baseline = kscreen_snapshot();
+    let mut policy = kscreen_policy("DP-1", "verify_only");
+    policy.resolution_option = Some(crate::ResolutionOption::Manual);
+    policy.manual_resolution = Some("1920x1080".into());
+    let resolved = kscreen::resolve(
+        &mut FakePlatform::default(),
+        serde_json::from_value(kscreen_configuration()).unwrap(),
+        &baseline,
+        Some(policy),
+        None,
+        Some(&baseline.revision().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(
+        (resolved.displays[0].width, resolved.displays[0].height),
+        (1920, 1080)
+    );
+    assert_eq!(resolved.displays[1].x, 2560);
+    assert_eq!(resolved.displays[1].width, 1920);
+}
+
+#[test]
+fn kscreen_policy_activation_uses_observed_scale_and_rotation_for_placement() {
+    let mut baseline = kscreen_snapshot();
+    baseline.outputs[1].enabled = false;
+    let resolved = kscreen::resolve(
+        &mut FakePlatform::default(),
+        serde_json::from_value(kscreen_configuration()).unwrap(),
+        &baseline,
+        Some(kscreen_policy("DP-2", "ensure_active")),
+        None,
+        Some(&baseline.revision().unwrap()),
+    )
+    .unwrap();
+    let target = resolved
+        .displays
+        .iter()
+        .find(|display| display.id == "DP-2")
+        .unwrap();
+    // The 2560-pixel peer uses 150% scaling, so its logical right edge is 1707.
+    assert_eq!(target.x, 1707);
+    assert_eq!(target.y, 0);
+    assert_eq!(resolved.displays.len(), 2);
+}
+
+#[test]
+fn kscreen_policy_changes_primary_or_uses_only_selected_output() {
+    let baseline = kscreen_snapshot();
+    for option in ["ensure_primary", "ensure_only_display"] {
+        let resolved = kscreen::resolve(
+            &mut FakePlatform::default(),
+            serde_json::from_value(kscreen_configuration()).unwrap(),
+            &baseline,
+            Some(kscreen_policy("DP-2", option)),
+            None,
+            Some(&baseline.revision().unwrap()),
+        )
+        .unwrap();
+        let target = resolved
+            .displays
+            .iter()
+            .find(|display| display.id == "DP-2")
+            .unwrap();
+        assert_eq!((target.x, target.y), (0, 0));
+        if option == "ensure_only_display" {
+            assert_eq!(resolved.displays.len(), 1);
+        } else {
+            assert_eq!(resolved.displays[0].x, -2560);
+            assert_eq!(resolved.displays[0].width, 2560);
+        }
+    }
+}
+
+#[test]
+fn kscreen_policy_can_activate_the_first_connected_output() {
+    let mut baseline = kscreen_snapshot();
+    for output in &mut baseline.outputs {
+        output.enabled = false;
+        output.primary = false;
+        output.priority = 0;
+    }
+    let requested = json!({"displays":[{
+        "id":"DP-2","width":1920,"height":1080,"x":0,"y":0,
+        "refresh":{"numerator":60,"denominator":1}
+    }]});
+    for option in ["ensure_active", "ensure_primary", "ensure_only_display"] {
+        let resolved = kscreen::resolve(
+            &mut FakePlatform::default(),
+            serde_json::from_value(requested.clone()).unwrap(),
+            &baseline,
+            Some(kscreen_policy("DP-2", option)),
+            None,
+            Some(&baseline.revision().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(resolved.displays.len(), 1);
+        assert_eq!((resolved.displays[0].x, resolved.displays[0].y), (0, 0));
+    }
+}
+
+#[test]
+fn kscreen_policy_rejects_inactive_verify_only_and_unfenced_activation() {
+    let mut baseline = kscreen_snapshot();
+    baseline.outputs[1].enabled = false;
+    for (option, revision, code) in [
+        (
+            "verify_only",
+            Some(baseline.revision().unwrap()),
+            "unsupported_display",
+        ),
+        ("ensure_active", None, "invalid_request"),
+    ] {
+        let result = kscreen::resolve(
+            &mut FakePlatform::default(),
+            serde_json::from_value(kscreen_configuration()).unwrap(),
+            &baseline,
+            Some(kscreen_policy("DP-2", option)),
+            None,
+            revision.as_deref(),
+        );
+        assert_eq!(result.unwrap_err().code, code);
+    }
+}
+
+#[test]
+fn kscreen_only_display_policy_is_durable_and_restores_the_complete_topology() {
+    let baseline = kscreen_snapshot();
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(baseline.clone()),
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply","operation_id":"physical-only-display",
+            "configuration":kscreen_configuration(),
+            "expected_topology_revision":baseline.revision().unwrap(),
+            "mode_policy":kscreen_policy("DP-2","ensure_only_display")
+        }),
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert!(state.journal.is_some());
+    let current = pipeline.platform.kscreen_baseline.as_ref().unwrap();
+    assert!(!current.outputs[0].enabled);
+    assert!(current.outputs[1].enabled);
+    assert!(current.outputs[1].primary);
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":applied["lease"]}),
+    );
+    assert_eq!(restored["restored"], true, "{restored}");
+    assert_eq!(pipeline.platform.kscreen_baseline.as_ref(), Some(&baseline));
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn kscreen_verify_only_applies_refresh_and_hdr_with_topology_preserved() {
+    let baseline = kscreen_snapshot();
+    let mut policy = kscreen_policy("DP-2", "verify_only");
+    policy.refresh_rate_option = Some(crate::RefreshRateOption::Manual);
+    policy.manual_refresh_rate = Some("75".into());
+    policy.hdr_option = Some(crate::DisplayHdrOption::Auto);
+    policy.effective_client_hdr_request = Some(true);
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(baseline.clone()),
+            ..Default::default()
+        },
+        true,
+    );
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply","configuration":kscreen_configuration(),
+            "expected_topology_revision":baseline.revision().unwrap(),"mode_policy":policy
+        }),
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    let current = pipeline.platform.kscreen_baseline.as_ref().unwrap();
+    let mut expected = baseline.clone();
+    expected.outputs[1].mode.as_mut().unwrap().refresh_millihz = 75_000;
+    expected.outputs[1].hdr_enabled = Some(true);
+    assert!(expected.matches_topology_restoration(current));
+    assert_eq!(current.outputs[1].position, baseline.outputs[1].position);
+    assert_eq!(
+        current.outputs[1].mode.as_ref().unwrap().refresh_millihz,
+        75_000
+    );
+    assert_eq!(current.outputs[1].hdr_enabled, Some(true));
 }
 
 #[test]

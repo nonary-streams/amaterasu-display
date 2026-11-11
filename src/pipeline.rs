@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::SERVICE;
+mod kscreen;
 mod scoped;
 mod targets;
 use crate::configuration_option::DisplayConfigurationOption;
@@ -633,16 +634,17 @@ impl<P: Platform> Pipeline<P> {
                     Err(error) => return complete(send, context.request, error.payload()),
                 };
                 if let Some(kscreen_baseline) = kscreen_baseline {
-                    if mode_policy.is_some() || mode_policies.is_some() {
-                        return complete(
-                            send,
-                            context.request,
-                            failure(
-                                "unsupported_topology",
-                                "KScreen direct apply does not yet support mode or topology policies",
-                            ),
-                        );
-                    }
+                    configuration = match kscreen::resolve(
+                        &mut self.platform,
+                        configuration,
+                        &kscreen_baseline,
+                        mode_policy,
+                        mode_policies,
+                        expected_topology_revision.as_deref(),
+                    ) {
+                        Ok(configuration) => configuration,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
                     return self.prepare_kscreen_lease(
                         context,
                         revision,
@@ -1106,16 +1108,13 @@ impl<P: Platform> Pipeline<P> {
             operation_id,
             request_identity,
         } = intent;
-        if let Err(error) = configuration.validate() {
-            return complete(send, context.request, error.payload());
-        }
         if !context.inherited_scoped.is_empty()
             && let Err(error) =
                 self.validate_protected_configuration(&configuration, &context.inherited_scoped)
         {
             return complete(send, context.request, error.payload());
         }
-        if let Err(error) = baseline.validate_requested_topology(&configuration) {
+        if let Err(error) = baseline.validate_topology_configuration(&configuration) {
             return complete(send, context.request, error.payload());
         }
         let baseline_revision = match baseline.revision() {
@@ -1476,7 +1475,11 @@ fn restore_journal_snapshot<P: Platform>(
     match &journal.snapshot {
         RecoveryBaseline::Ccd(snapshot) => platform.restore(snapshot, guard),
         RecoveryBaseline::KScreen(baseline) => {
-            platform.restore_kscreen_snapshot(baseline, guard)?;
+            if journal.normal_active {
+                platform.restore_topology_kscreen_snapshot(baseline, guard)?;
+            } else {
+                platform.restore_kscreen_snapshot(baseline, guard)?;
+            }
             let current = platform
                 .capture_kscreen_snapshot()
                 .map_err(DisplayError::after_mutation)?
@@ -1487,7 +1490,12 @@ fn restore_journal_snapshot<P: Platform>(
                     )
                     .after_mutation()
                 })?;
-            if !baseline.matches_restoration(&current) {
+            let restored = if journal.normal_active {
+                baseline.matches_topology_restoration(&current)
+            } else {
+                baseline.matches_restoration(&current)
+            };
+            if !restored {
                 return Err(DisplayError::new(
                     "verification_failed",
                     "KScreen restored topology does not match its durable baseline",
@@ -1536,7 +1544,7 @@ fn verify_kscreen_configuration<P: Platform>(
             )
             .after_mutation()
         })?;
-    if !current.matches_configuration(baseline, configuration) {
+    if !current.matches_topology_configuration(baseline, configuration) {
         return Err(DisplayError::new(
             "verification_failed",
             "KScreen readback does not match the requested configuration",
