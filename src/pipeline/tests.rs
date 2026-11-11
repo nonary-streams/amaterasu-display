@@ -4786,6 +4786,46 @@ fn interrupted_kscreen_lease_holds_on_hotplug_and_readback_failure() {
 }
 
 #[test]
+fn old_mixed_physical_journal_never_invokes_a_restore_provider() {
+    let mut baseline = kscreen_snapshot();
+    baseline.outputs[1].id = "Virtual-1".into();
+    let journal = Journal {
+        normal_active: true,
+        scoped_targets: Vec::new(),
+        scoped_pending: None,
+        scoped_origin_shift: (0, 0),
+        owner: "owner".into(),
+        lease: "old-mixed-physical".into(),
+        snapshot: RecoveryBaseline::KScreen(baseline.clone()),
+        operation_id: None,
+        request_identity: None,
+        requested_configuration: None,
+        expected_topology_revision: None,
+        pending_route: None,
+    };
+    let mut state = State {
+        journal: Some(serde_json::to_value(journal).unwrap()),
+        ..Default::default()
+    };
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(baseline),
+            ..Default::default()
+        },
+        true,
+    );
+    let rejected = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"recover","lease":"old-mixed-physical"}),
+    );
+    assert_eq!(rejected["error"]["code"], "unsupported_topology");
+    assert_eq!(pipeline.platform.kscreen_restore_calls, 0);
+    assert!(pipeline.platform.effects.is_empty());
+    assert!(state.journal.is_some());
+}
+
+#[test]
 fn physical_domain_tracks_durable_lease_revision_and_rejects_stale_plans() {
     let mut state = State::default();
     let mut pipeline = Pipeline::new(FakePlatform::default(), true);

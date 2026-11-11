@@ -1460,6 +1460,7 @@ fn restore_journal_snapshot<P: Platform>(
         RecoveryBaseline::Ccd(snapshot) => platform.restore(snapshot, guard),
         RecoveryBaseline::KScreen(baseline) => {
             if journal.normal_active {
+                baseline.validate_physical_topology_inventory()?;
                 platform.restore_topology_kscreen_snapshot(baseline, guard)?;
             } else {
                 platform.restore_kscreen_snapshot(baseline, guard)?;
