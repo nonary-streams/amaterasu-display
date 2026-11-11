@@ -1,7 +1,7 @@
 //! KDE/KScreen discovery and a capability-gated, conservative transaction path.
 //!
-//! Native display mutations remain unsupported on Linux until the journaled
-//! apply/restore path is centrally tested and its platform behavior reviewed.
+//! Full topology leases retain complete native baselines; scoped composition
+//! retains its narrower active-set and primary-output ownership boundary.
 use super::{Platform, TopologyShape};
 use crate::model::{
     Address, AvailableMode, Configuration, DisplayError, DisplayResult, KScreenModeSnapshot,
@@ -24,6 +24,7 @@ const KSCREEN_MUTATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Debug, PartialEq)]
 enum KScreenAction {
+    Enabled { output: String, enabled: bool },
     Mode { output: String, mode: String },
     Position { output: String, x: i32, y: i32 },
     Scale { output: String, scale: f64 },
@@ -35,7 +36,8 @@ enum KScreenAction {
 impl KScreenAction {
     fn argument(&self) -> DisplayResult<String> {
         let output = match self {
-            Self::Mode { output, .. }
+            Self::Enabled { output, .. }
+            | Self::Mode { output, .. }
             | Self::Position { output, .. }
             | Self::Scale { output, .. }
             | Self::Rotation { output, .. }
@@ -45,6 +47,9 @@ impl KScreenAction {
         validate_output_id(output)?;
         let prefix = format!("output.{output}.");
         Ok(match self {
+            Self::Enabled { enabled, .. } => {
+                format!("{prefix}{}", if *enabled { "enable" } else { "disable" })
+            }
             Self::Mode { mode, .. } => {
                 safe_mode_id(mode)?;
                 format!("{prefix}mode.{mode}")
@@ -206,10 +211,8 @@ impl Platform for LinuxPlatform {
         "linux_kscreen"
     }
 
-    // KScreen snapshot journaling is available, but output mutations remain
-    // gated until restoration and exact readback are qualified.
     fn supported(&self) -> bool {
-        false
+        true
     }
 
     fn supports_scoped_composition(&self) -> bool {
@@ -267,59 +270,7 @@ impl Platform for LinuxPlatform {
         requested: &Configuration,
         baseline: &KScreenSnapshot,
     ) -> DisplayResult<()> {
-        baseline.validate_requested_topology(requested)?;
-        let current = query_configuration()?;
-        let outputs = validated_outputs(&current)?;
-        if typed_snapshot(&outputs)?.revision()? != baseline.revision()? {
-            return Err(DisplayError::new(
-                "topology_changed",
-                "KScreen topology changed before configuration preparation",
-            ));
-        }
-        for display in &requested.displays {
-            let output = outputs
-                .iter()
-                .copied()
-                .find(|output| {
-                    output_name(output).is_ok_and(|name| name.eq_ignore_ascii_case(&display.id))
-                })
-                .ok_or_else(|| {
-                    DisplayError::new(
-                        "topology_changed",
-                        "requested KScreen output is no longer connected",
-                    )
-                })?;
-            let requested_millihz = ((u64::from(display.refresh.numerator) * 1000
-                + u64::from(display.refresh.denominator) / 2)
-                / u64::from(display.refresh.denominator))
-                as u32;
-            let mode_available = output_modes(output)?.into_iter().any(|mode| {
-                integer_field(mode, "size", "width").ok() == Some(display.width)
-                    && integer_field(mode, "size", "height").ok() == Some(display.height)
-                    && mode_refresh_millihz(mode).ok() == Some(requested_millihz)
-            });
-            if !mode_available {
-                return Err(DisplayError::new(
-                    "unsupported_display",
-                    "requested KScreen mode is unavailable",
-                ));
-            }
-            let saved_hdr = baseline
-                .outputs
-                .iter()
-                .find(|saved| saved.id.eq_ignore_ascii_case(&display.id))
-                .and_then(|saved| saved.hdr_enabled);
-            if display
-                .hdr_enabled
-                .is_some_and(|requested| saved_hdr != Some(requested))
-            {
-                return Err(DisplayError::new(
-                    "unsupported_topology",
-                    "KScreen preparation does not yet support changing HDR state",
-                ));
-            }
-        }
-        Ok(())
+        topology::prepare(requested, baseline, &query_configuration()?)
     }
 
     fn restore_kscreen_snapshot(
@@ -331,6 +282,14 @@ impl Platform for LinuxPlatform {
         restore_kscreen_snapshot_with(&mut runner, baseline, guard)
     }
 
+    fn restore_topology_kscreen_snapshot(
+        &mut self,
+        baseline: &KScreenSnapshot,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        topology::restore(&mut SystemKScreenCommandRunner, baseline, guard)
+    }
+
     fn apply_kscreen_snapshot(
         &mut self,
         configuration: &Configuration,
@@ -338,7 +297,7 @@ impl Platform for LinuxPlatform {
         guard: &mut dyn FnMut() -> DisplayResult<()>,
     ) -> DisplayResult<()> {
         let mut runner = SystemKScreenCommandRunner;
-        apply_kscreen_snapshot_with(&mut runner, configuration, baseline, guard)
+        topology::apply(&mut runner, configuration, baseline, guard)
     }
 
     fn prepare_scoped_kscreen_snapshot(
@@ -379,8 +338,36 @@ impl Platform for LinuxPlatform {
         Err(unsupported_mutation())
     }
 
-    fn available_modes(&mut self, _: &str) -> DisplayResult<Vec<AvailableMode>> {
-        Err(unsupported_mutation())
+    fn available_modes(&mut self, display: &str) -> DisplayResult<Vec<AvailableMode>> {
+        let current = query_configuration()?;
+        let outputs = validated_outputs(&current)?;
+        let output = outputs
+            .into_iter()
+            .find(|output| {
+                output_name(output).is_ok_and(|name| name.eq_ignore_ascii_case(display))
+                    && output.get("connected") == Some(&Value::Bool(true))
+            })
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "unsupported_display",
+                    "connected KScreen target is unavailable",
+                )
+            })?;
+        output_modes(output)?
+            .into_iter()
+            .map(|mode| {
+                let refresh = refresh_rational(mode)?;
+                Ok(AvailableMode {
+                    width: integer_field(mode, "size", "width")?,
+                    height: integer_field(mode, "size", "height")?,
+                    nominal_refresh_hz: (refresh.numerator + refresh.denominator / 2)
+                        / refresh.denominator,
+                    refresh,
+                    bits_per_pixel: 32,
+                    exact_current: mode.get("id") == output.get("currentModeId"),
+                })
+            })
+            .collect()
     }
 
     fn prepare(&mut self, _: &Configuration) -> DisplayResult<Snapshot> {
@@ -438,7 +425,7 @@ impl Platform for LinuxPlatform {
 fn unsupported_mutation() -> DisplayError {
     DisplayError::new(
         "unsupported_platform",
-        "Linux KScreen mutation capability remains disabled pending central safety qualification",
+        "Linux display transactions require a KScreen recovery baseline; CCD-only operations are unsupported",
     )
 }
 
@@ -652,6 +639,7 @@ fn action_arguments(actions: &[KScreenAction]) -> DisplayResult<Vec<String>> {
     actions.iter().map(KScreenAction::argument).collect()
 }
 
+#[cfg(test)]
 fn apply_kscreen_snapshot_with(
     runner: &mut impl KScreenCommandRunner,
     configuration: &Configuration,
@@ -929,6 +917,7 @@ fn typed_snapshot(outputs: &[&Value]) -> DisplayResult<KScreenSnapshot> {
         };
         saved.push(KScreenOutputSnapshot {
             id: output_name(output)?.to_owned(),
+            hardware_identity: identity::monitor_identity(output)?,
             connected: bool_field(output, "connected")?,
             enabled: bool_field(output, "enabled")?,
             mode,
@@ -1690,3 +1679,7 @@ fn rotation_name(rotation: u16) -> Option<&'static str> {
 #[cfg(test)]
 #[path = "linux/tests.rs"]
 mod tests;
+
+mod topology;
+
+mod identity;

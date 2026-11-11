@@ -65,6 +65,7 @@ fn kscreen_snapshot() -> KScreenSnapshot {
         outputs: vec![
             KScreenOutputSnapshot {
                 id: "DP-1".into(),
+                hardware_identity: Some("hardware:DP-1".into()),
                 connected: true,
                 enabled: true,
                 mode: Some(KScreenModeSnapshot {
@@ -82,6 +83,7 @@ fn kscreen_snapshot() -> KScreenSnapshot {
             },
             KScreenOutputSnapshot {
                 id: "DP-2".into(),
+                hardware_identity: Some("hardware:DP-2".into()),
                 connected: true,
                 enabled: true,
                 mode: Some(KScreenModeSnapshot {
@@ -4182,6 +4184,7 @@ fn kscreen_snapshot_rejects_payloads_over_the_journal_byte_limit() {
     for index in 0..62 {
         snapshot.outputs.push(KScreenOutputSnapshot {
             id: format!("DISPLAY-{}-{index}", "x".repeat(105)),
+            hardware_identity: None,
             connected: false,
             enabled: false,
             mode: None,
@@ -4210,6 +4213,7 @@ fn kscreen_readback_matching_is_identity_and_state_exact_but_order_independent()
     let mut disconnected_baseline = baseline.clone();
     disconnected_baseline.outputs.push(KScreenOutputSnapshot {
         id: "DP-3".into(),
+        hardware_identity: None,
         connected: false,
         enabled: false,
         mode: None,
@@ -4225,6 +4229,7 @@ fn kscreen_readback_matching_is_identity_and_state_exact_but_order_independent()
     let mut hotplugged = baseline.clone();
     hotplugged.outputs.push(KScreenOutputSnapshot {
         id: "DP-3".into(),
+        hardware_identity: None,
         connected: true,
         enabled: true,
         mode: Some(KScreenModeSnapshot {

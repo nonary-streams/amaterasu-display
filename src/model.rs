@@ -511,6 +511,9 @@ pub struct KScreenSnapshot {
 #[serde(deny_unknown_fields)]
 pub struct KScreenOutputSnapshot {
     pub id: String,
+    /// Opaque compositor monitor identity; absent in legacy recovery journals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hardware_identity: Option<String>,
     pub connected: bool,
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -566,6 +569,11 @@ impl KScreenSnapshot {
         for output in &self.outputs {
             if output.id.is_empty()
                 || output.id.len() > 128
+                || output.hardware_identity.as_ref().is_some_and(|identity| {
+                    identity.is_empty()
+                        || identity.len() > 1024
+                        || identity.chars().any(char::is_control)
+                })
                 || !output
                     .id
                     .bytes()
@@ -641,6 +649,195 @@ impl KScreenSnapshot {
             second = (second ^ u64::from(byte)).wrapping_mul(0x100000001b3);
         }
         Ok(format!("{first:016x}{second:016x}"))
+    }
+
+    /// Validate a complete desired enabled-output set against a saved native
+    /// inventory. Scoped composition continues to use its stricter validator.
+    pub fn validate_topology_configuration(
+        &self,
+        configuration: &Configuration,
+    ) -> Result<(), DisplayError> {
+        self.validate()?;
+        if self
+            .outputs
+            .iter()
+            .any(|output| output.connected && output.hardware_identity.is_none())
+        {
+            return Err(DisplayError::new(
+                "recovery_blocked",
+                "physical topology requires known monitor identities",
+            ));
+        }
+        let scales = self
+            .outputs
+            .iter()
+            .filter(|output| output.connected)
+            .map(|output| (output.id.to_ascii_lowercase(), output.scale))
+            .collect();
+        configuration.validate_with_scales(Some(&scales))?;
+        if configuration
+            .displays
+            .iter()
+            .filter(|display| display.x == 0 && display.y == 0)
+            .count()
+            != 1
+            || configuration.displays.iter().any(|display| {
+                !self
+                    .outputs
+                    .iter()
+                    .any(|output| output.connected && output.id.eq_ignore_ascii_case(&display.id))
+            })
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "KScreen requires connected targets and exactly one primary origin",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Expected semantic state after a full topology transaction. Native mode
+    /// IDs are selected against the fresh catalog by the platform provider.
+    pub fn configured_topology(&self, configuration: &Configuration) -> Result<Self, DisplayError> {
+        self.validate_topology_configuration(configuration)?;
+        let mut expected = self.clone();
+        let preserve_priorities = configuration.displays.iter().any(|display| {
+            display.x == 0
+                && display.y == 0
+                && self
+                    .outputs
+                    .iter()
+                    .any(|output| output.primary && output.id.eq_ignore_ascii_case(&display.id))
+        });
+        let mut used_priorities: BTreeSet<u32> = if preserve_priorities {
+            self.outputs
+                .iter()
+                .filter(|output| output.enabled)
+                .map(|output| output.priority)
+                .collect()
+        } else {
+            BTreeSet::from([1])
+        };
+        let mut next_priority = 2;
+        for display in &configuration.displays {
+            let output = expected
+                .outputs
+                .iter_mut()
+                .find(|output| output.id.eq_ignore_ascii_case(&display.id))
+                .expect("validated connected output");
+            output.enabled = true;
+            output.mode = Some(KScreenModeSnapshot {
+                id: "configured".into(),
+                width: display.width,
+                height: display.height,
+                refresh_millihz: ((u64::from(display.refresh.numerator) * 1000
+                    + u64::from(display.refresh.denominator) / 2)
+                    / u64::from(display.refresh.denominator))
+                    as u32,
+            });
+            output.position = KScreenPosition {
+                x: display.x,
+                y: display.y,
+            };
+            output.rotation = match display.rotation {
+                Rotation::Identity => 1,
+                Rotation::Rotate90 => 2,
+                Rotation::Rotate180 => 4,
+                Rotation::Rotate270 => 8,
+            };
+            output.primary = display.x == 0 && display.y == 0;
+            output.priority = if output.primary {
+                1
+            } else if preserve_priorities && output.priority > 1 {
+                output.priority
+            } else {
+                while used_priorities.contains(&next_priority) {
+                    next_priority += 1;
+                }
+                let priority = next_priority;
+                used_priorities.insert(priority);
+                next_priority += 1;
+                priority
+            };
+            if display.hdr_enabled.is_some() {
+                output.hdr_enabled = display.hdr_enabled;
+            }
+        }
+        for output in &mut expected.outputs {
+            if output.connected
+                && !configuration
+                    .displays
+                    .iter()
+                    .any(|display| output.id.eq_ignore_ascii_case(&display.id))
+            {
+                output.enabled = false;
+                output.primary = false;
+                output.priority = 0;
+            }
+        }
+        expected.validate()?;
+        Ok(expected)
+    }
+
+    pub fn matches_topology_configuration(
+        &self,
+        baseline: &Self,
+        configuration: &Configuration,
+    ) -> bool {
+        baseline
+            .configured_topology(configuration)
+            .is_ok_and(|expected| expected.matches_topology_restoration(self))
+    }
+
+    /// A disabled connector has no active mode or scanout priority to restore.
+    /// Its complete saved record remains in the journal for later activation.
+    pub fn matches_topology_restoration(&self, current: &Self) -> bool {
+        if self.validate().is_err() || current.validate().is_err() {
+            return false;
+        }
+        if current.outputs.iter().any(|present| {
+            present.connected
+                && !self
+                    .outputs
+                    .iter()
+                    .any(|saved| saved.connected && saved.id.eq_ignore_ascii_case(&present.id))
+        }) {
+            return false;
+        }
+        self.outputs.iter().all(|saved| {
+            let Some(present) = current
+                .outputs
+                .iter()
+                .find(|present| saved.id.eq_ignore_ascii_case(&present.id))
+            else {
+                return !saved.connected;
+            };
+            if saved.connected != present.connected
+                || saved.enabled != present.enabled
+                || (saved.connected
+                    && (saved.hardware_identity.is_none()
+                        || saved.hardware_identity != present.hardware_identity))
+            {
+                return false;
+            }
+            if !saved.enabled {
+                return true;
+            }
+            saved
+                .mode
+                .as_ref()
+                .map(|mode| (mode.width, mode.height, mode.refresh_millihz))
+                == present
+                    .mode
+                    .as_ref()
+                    .map(|mode| (mode.width, mode.height, mode.refresh_millihz))
+                && saved.position == present.position
+                && saved.scale == present.scale
+                && saved.rotation == present.rotation
+                && saved.priority == present.priority
+                && saved.primary == present.primary
+                && saved.hdr_enabled == present.hdr_enabled
+        })
     }
 
     pub fn validate_requested_topology(

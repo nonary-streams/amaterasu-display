@@ -77,6 +77,15 @@ pub trait Platform {
             "KScreen journal restoration is not implemented by this provider",
         ))
     }
+    /// Restore a normal lease that admitted a complete enabled-output set.
+    /// Scoped recovery continues to use the narrower restoration method.
+    fn restore_topology_kscreen_snapshot(
+        &mut self,
+        baseline: &KScreenSnapshot,
+        guard: &mut dyn FnMut() -> DisplayResult<()>,
+    ) -> DisplayResult<()> {
+        self.restore_kscreen_snapshot(baseline, guard)
+    }
     /// Apply a KScreen configuration and return success only after exact
     /// requested-state readback verification.
     fn apply_kscreen_snapshot(

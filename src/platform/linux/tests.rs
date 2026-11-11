@@ -81,6 +81,7 @@ fn output(
 ) -> Value {
     json!({
         "name": name,
+        "uuid":format!("monitor-{name}"),
         "description": format!("{name} monitor"),
         "connected": connected,
         "enabled": enabled,
@@ -278,6 +279,12 @@ fn apply_fake_action(configuration: &mut Value, action: &KScreenAction) {
         })
         .unwrap();
     match action {
+        KScreenAction::Enabled { enabled, .. } => {
+            output["enabled"] = json!(enabled);
+            if !enabled {
+                output["priority"] = json!(0);
+            }
+        }
         KScreenAction::Mode { mode, .. } => output["currentModeId"] = json!(mode),
         KScreenAction::Position { x, y, .. } => output["pos"] = json!({"x":x,"y":y}),
         KScreenAction::Scale { scale, .. } => output["scale"] = json!(scale),
@@ -289,7 +296,8 @@ fn apply_fake_action(configuration: &mut Value, action: &KScreenAction) {
 
 fn action_output(action: &KScreenAction) -> &str {
     match action {
-        KScreenAction::Mode { output, .. }
+        KScreenAction::Enabled { output, .. }
+        | KScreenAction::Mode { output, .. }
         | KScreenAction::Position { output, .. }
         | KScreenAction::Scale { output, .. }
         | KScreenAction::Rotation { output, .. }
@@ -931,11 +939,348 @@ fn malformed_or_unsafe_kscreen_id_fails_closed() {
 }
 
 #[test]
-fn linux_mutation_capability_remains_disabled() {
+fn linux_normal_topology_support_uses_kscreen_recovery_not_ccd() {
     let mut platform = LinuxPlatform;
-    assert!(!platform.supported());
+    assert!(platform.supported());
     assert_eq!(
         platform.snapshot().unwrap_err().code,
         "unsupported_platform"
     );
+}
+
+fn only_hdmi_request(hdr: bool) -> Configuration {
+    serde_json::from_value(json!({"displays":[{
+        "id":"HDMI-A-1","width":1920,"height":1080,
+        "refresh":{"numerator":60,"denominator":1},"x":0,"y":0,
+        "hdr_enabled":hdr
+    }]}))
+    .unwrap()
+}
+
+#[test]
+fn normal_topology_activates_inactive_target_then_restores_original_enabled_set() {
+    let raw = configuration();
+    let baseline = typed_snapshot_for(&raw);
+    let request = only_hdmi_request(false);
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    topology::apply(&mut runner, &request, &baseline, &mut || Ok(())).unwrap();
+    let configured = typed_snapshot_for(runner.current.as_ref().unwrap());
+    assert!(configured.matches_topology_configuration(&baseline, &request));
+    assert!(
+        !configured
+            .outputs
+            .iter()
+            .find(|output| output.id == "DP-1")
+            .unwrap()
+            .enabled
+    );
+    let transactions: Vec<_> = runner
+        .commands
+        .iter()
+        .enumerate()
+        .filter_map(|(index, command)| {
+            if let KScreenCommand::Configure(actions) = command {
+                Some((index, actions))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(transactions.len(), 2);
+    assert!(transactions[0].1.iter().any(
+        |action| matches!(action,KScreenAction::Enabled{output,enabled:true} if output=="HDMI-A-1")
+    ));
+    assert!(
+        transactions[0]
+            .1
+            .iter()
+            .all(|action| !matches!(action, KScreenAction::Enabled { enabled: false, .. }))
+    );
+    assert!(transactions[1].1.iter().any(
+        |action| matches!(action,KScreenAction::Enabled{output,enabled:false} if output=="DP-1")
+    ));
+    assert!(
+        runner.commands[transactions[0].0 + 1..transactions[1].0]
+            .iter()
+            .any(|command| matches!(command, KScreenCommand::Query))
+    );
+    topology::restore(&mut runner, &baseline, &mut || Ok(())).unwrap();
+    assert!(
+        baseline
+            .matches_topology_restoration(&typed_snapshot_for(runner.current.as_ref().unwrap()))
+    );
+    let count = runner
+        .commands
+        .iter()
+        .filter(|command| matches!(command, KScreenCommand::Configure(_)))
+        .count();
+    topology::restore(&mut runner, &baseline, &mut || Ok(())).unwrap();
+    assert_eq!(
+        count,
+        runner
+            .commands
+            .iter()
+            .filter(|command| matches!(command, KScreenCommand::Configure(_)))
+            .count()
+    );
+}
+
+#[test]
+fn normal_topology_changes_primary_while_preserving_peer_scale_and_mode() {
+    let raw = reference_kde_configuration();
+    let baseline = typed_snapshot_for(&raw);
+    let request:Configuration=serde_json::from_value(json!({"displays":[
+        {"id":"DP-2","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0,"rotation":"rotate90"},
+        {"id":"DP-1","width":2560,"height":1440,"refresh":{"numerator":60,"denominator":1},"x":-1707,"y":0}
+    ]})).unwrap();
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    topology::apply(&mut runner, &request, &baseline, &mut || Ok(())).unwrap();
+    let observed = typed_snapshot_for(runner.current.as_ref().unwrap());
+    assert!(observed.matches_topology_configuration(&baseline, &request));
+    assert!(
+        observed
+            .outputs
+            .iter()
+            .find(|output| output.id == "DP-2")
+            .unwrap()
+            .primary
+    );
+    assert_eq!(observed.outputs[0].scale, baseline.outputs[0].scale);
+    topology::restore(&mut runner, &baseline, &mut || Ok(())).unwrap();
+    assert!(
+        baseline
+            .matches_topology_restoration(&typed_snapshot_for(runner.current.as_ref().unwrap()))
+    );
+}
+
+#[test]
+fn normal_topology_rejects_invalid_modes_empty_target_set_and_hotplug_before_effects() {
+    let raw = configuration();
+    let baseline = typed_snapshot_for(&raw);
+    let mut invalid = only_hdmi_request(false);
+    invalid.displays[0].width = 2560;
+    for request in [invalid, Configuration { displays: vec![] }] {
+        let mut runner = FakeKScreenRunner {
+            current: Some(raw.clone()),
+            ..Default::default()
+        };
+        assert!(topology::apply(&mut runner, &request, &baseline, &mut || Ok(())).is_err());
+        assert!(
+            runner
+                .commands
+                .iter()
+                .all(|command| matches!(command, KScreenCommand::Query))
+        );
+    }
+    let mut hotplug = raw;
+    hotplug["outputs"][1]["connected"] = json!(false);
+    let mut runner = FakeKScreenRunner {
+        current: Some(hotplug),
+        ..Default::default()
+    };
+    assert_eq!(
+        topology::apply(
+            &mut runner,
+            &only_hdmi_request(false),
+            &baseline,
+            &mut || Ok(())
+        )
+        .unwrap_err()
+        .code,
+        "topology_changed"
+    );
+    assert!(
+        runner
+            .commands
+            .iter()
+            .all(|command| matches!(command, KScreenCommand::Query))
+    );
+}
+
+#[test]
+fn partial_normal_topology_keeps_old_scanout_and_marks_recovery_required() {
+    let raw = configuration();
+    let baseline = typed_snapshot_for(&raw);
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        partial_configuration: true,
+        ..Default::default()
+    };
+    let error = topology::apply(
+        &mut runner,
+        &only_hdmi_request(false),
+        &baseline,
+        &mut || Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.may_have_changed);
+    assert_eq!(
+        runner.current.as_ref().unwrap()["outputs"][0]["enabled"],
+        true
+    );
+}
+
+#[test]
+fn full_topology_hdr_waits_for_enabled_target_and_exact_geometry_before_activation() {
+    let raw = configuration();
+    let baseline = typed_snapshot_for(&raw);
+    let request = only_hdmi_request(true);
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    topology::apply(&mut runner, &request, &baseline, &mut || Ok(())).unwrap();
+    let transactions: Vec<_> = runner
+        .commands
+        .iter()
+        .filter_map(|command| {
+            if let KScreenCommand::Configure(actions) = command {
+                Some(actions)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(transactions.len(), 3);
+    assert!(transactions[0].iter().any(
+        |action| matches!(action,KScreenAction::Enabled{output,enabled:true} if output=="HDMI-A-1")
+    ));
+    assert!(
+        transactions[0]
+            .iter()
+            .all(|action| !matches!(action, KScreenAction::Hdr { enabled: true, .. }))
+    );
+    assert_eq!(
+        transactions[1],
+        &vec![KScreenAction::Hdr {
+            output: "HDMI-A-1".into(),
+            enabled: true
+        }]
+    );
+    assert!(
+        typed_snapshot_for(runner.current.as_ref().unwrap())
+            .matches_topology_configuration(&baseline, &request)
+    );
+}
+
+#[test]
+fn old_scanout_is_never_disabled_when_replacement_readback_is_ignored() {
+    for partial in [false, true] {
+        let raw = configuration();
+        let baseline = typed_snapshot_for(&raw);
+        let mut runner = FakeKScreenRunner {
+            current: Some(raw),
+            ignore_configuration: !partial,
+            partial_configuration: partial,
+            ..Default::default()
+        };
+        let error = topology::apply(
+            &mut runner,
+            &only_hdmi_request(false),
+            &baseline,
+            &mut || Ok(()),
+        )
+        .unwrap_err();
+        assert!(error.may_have_changed);
+        assert!(runner.commands.iter().all(|command|!matches!(command,KScreenCommand::Configure(actions) if actions.iter().any(|action|matches!(action,KScreenAction::Enabled{enabled:false,..})))));
+        assert_eq!(
+            runner.current.as_ref().unwrap()["outputs"][0]["enabled"],
+            true
+        );
+    }
+}
+
+#[test]
+fn full_topology_rejects_replaced_or_unidentified_physical_monitor_before_effects() {
+    let raw = configuration();
+    let baseline = typed_snapshot_for(&raw);
+    for uuid in [Value::Null, json!("replacement-monitor")] {
+        let mut replaced = raw.clone();
+        replaced["outputs"][1]["uuid"] = uuid;
+        let mut runner = FakeKScreenRunner {
+            current: Some(replaced),
+            ..Default::default()
+        };
+        assert!(
+            topology::apply(
+                &mut runner,
+                &only_hdmi_request(false),
+                &baseline,
+                &mut || Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            runner
+                .commands
+                .iter()
+                .all(|command| matches!(command, KScreenCommand::Query))
+        );
+        assert_eq!(
+            topology::restore(&mut runner, &baseline, &mut || Ok(()))
+                .unwrap_err()
+                .code,
+            "recovery_blocked"
+        );
+        assert!(
+            runner
+                .commands
+                .iter()
+                .all(|command| matches!(command, KScreenCommand::Query))
+        );
+    }
+}
+
+#[test]
+fn ensure_active_preserves_existing_secondary_priorities_even_if_request_order_differs() {
+    let mut raw = reference_kde_configuration();
+    raw["outputs"][1]["priority"] = json!(4);
+    let baseline = typed_snapshot_for(&raw);
+    let mut request: Configuration = serde_json::from_value(
+        configuration_snapshot(&raw, "test").unwrap()["configuration"].clone(),
+    )
+    .unwrap();
+    request.displays.reverse();
+    let expected = baseline.configured_topology(&request).unwrap();
+    assert_eq!(expected.outputs[1].priority, 4);
+}
+
+#[test]
+fn late_authorization_withdrawal_keeps_previous_scanout_after_replacement_activation() {
+    let raw = configuration();
+    let baseline = typed_snapshot_for(&raw);
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    let mut guards = 0;
+    let error = topology::apply(
+        &mut runner,
+        &only_hdmi_request(false),
+        &baseline,
+        &mut || {
+            guards += 1;
+            if guards == 3 {
+                Err(DisplayError::new("cancelled", "display lease ended"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "cancelled");
+    assert!(error.may_have_changed);
+    assert_eq!(
+        runner.current.as_ref().unwrap()["outputs"][0]["enabled"],
+        true
+    );
+    assert!(runner.commands.iter().all(|command| !matches!(command,
+        KScreenCommand::Configure(actions) if actions.iter().any(|action| matches!(action, KScreenAction::Enabled { enabled:false, .. }))
+    )));
 }
