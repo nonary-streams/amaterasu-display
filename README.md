@@ -50,7 +50,10 @@ General physical transactions conservatively reject inventories containing
 `Virtual-*` connectors, including legacy mixed baselines. Those outputs belong
 to their provider's streaming lifecycle and must not be recreated or removed
 from a physical desktop journal. Safe mixed physical/managed-virtual composition
-and physical clone layouts remain implementation gaps.
+and physical clone layouts remain implementation gaps. A primary change is also
+rejected when the selected secondary output is already at the coordinate origin
+while a different output remains primary; that case needs explicit native
+primary intent rather than inferring ownership from coordinates.
 
 `native_supported:true` reports the implemented Linux backend, while
 `allow_mutation` remains separately controlled and defaults to false. Fake
