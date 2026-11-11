@@ -4459,6 +4459,101 @@ fn kscreen_only_display_policy_is_durable_and_restores_the_complete_topology() {
 }
 
 #[test]
+fn only_display_policy_validates_geometry_after_removing_peers() {
+    let baseline = two_display_snapshot();
+    let mut requested = baseline.configuration().unwrap();
+    requested.displays[0].width = 3840;
+    requested.displays[0].height = 2160;
+    assert!(requested.validate().is_err());
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut state = State::default();
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        mutating_option_request(
+            "ensure_only_display",
+            "monitor.one",
+            serde_json::to_value(requested).unwrap(),
+            &json!(baseline.revision().unwrap()),
+        ),
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    assert_eq!(
+        pipeline
+            .platform
+            .prepared_configuration
+            .as_ref()
+            .unwrap()
+            .displays
+            .len(),
+        1
+    );
+
+    let kscreen = kscreen_snapshot();
+    let mut requested: Configuration = serde_json::from_value(kscreen_configuration()).unwrap();
+    requested.displays[0].width = 3840;
+    requested.displays[0].height = 2160;
+    assert!(requested.validate_kscreen(&kscreen).is_err());
+    let resolved = kscreen::resolve(
+        &mut FakePlatform::default(),
+        requested,
+        &kscreen,
+        Some(kscreen_policy("DP-1", "ensure_only_display")),
+        None,
+        Some(&kscreen.revision().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(resolved.displays.len(), 1);
+    assert_eq!(resolved.displays[0].width, 3840);
+}
+
+#[test]
+fn kscreen_verify_only_preserves_primary_identity_independent_of_origin() {
+    let mut baseline = kscreen_snapshot();
+    baseline.outputs[0].position.x = 1920;
+    baseline.outputs[1].position.x = 0;
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            kscreen_baseline: Some(baseline.clone()),
+            ..Default::default()
+        },
+        true,
+    );
+    let mut state = State::default();
+    let applied = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply","configuration":kscreen_configuration(),
+            "mode_policy":kscreen_policy("DP-2","verify_only"),
+            "expected_topology_revision":baseline.revision().unwrap()
+        }),
+    );
+    assert_eq!(applied["applied"], true, "{applied}");
+    let observed = pipeline.platform.kscreen_baseline.as_ref().unwrap();
+    assert!(observed.outputs[0].primary);
+    assert!(!observed.outputs[1].primary);
+    assert_eq!(observed.outputs[0].position.x, 1920);
+    assert_eq!(observed.outputs[1].position.x, 0);
+    let result = kscreen::resolve(
+        &mut FakePlatform::default(),
+        serde_json::from_value(kscreen_configuration()).unwrap(),
+        &baseline,
+        Some(kscreen_policy("DP-2", "ensure_primary")),
+        None,
+        Some(&baseline.revision().unwrap()),
+    );
+    assert_eq!(result.unwrap_err().code, "unsupported_topology");
+}
+
+#[test]
 fn kscreen_verify_only_applies_refresh_and_hdr_with_topology_preserved() {
     let baseline = kscreen_snapshot();
     let mut policy = kscreen_policy("DP-2", "verify_only");

@@ -839,19 +839,6 @@ impl<P: Platform> Pipeline<P> {
                     Err(error) => return complete(send, context.request, error.payload()),
                 };
                 let mut preferred_modes = Vec::new();
-                let singular_nonclone = policies.len() == 1
-                    && !configuration
-                        .displays
-                        .iter()
-                        .enumerate()
-                        .any(|(index, left)| {
-                            configuration.displays.iter().skip(index + 1).any(|right| {
-                                left.x == right.x
-                                    && left.y == right.y
-                                    && left.width == right.width
-                                    && left.height == right.height
-                            })
-                        });
                 let mut resolved_clone_modes = std::collections::BTreeMap::new();
                 for policy in policies {
                     let modes = if policy.refresh_rate_option
@@ -865,11 +852,8 @@ impl<P: Platform> Pipeline<P> {
                     } else {
                         None
                     };
-                    let resolution = if singular_nonclone {
-                        configuration.resolve_mode_policy(&policy, modes.as_deref())
-                    } else {
-                        configuration.resolve_mode_policy_in_batch(&policy, modes.as_deref())
-                    };
+                    let resolution =
+                        configuration.resolve_mode_policy_in_batch(&policy, modes.as_deref());
                     if let Err(error) = resolution {
                         return complete(send, context.request, error.payload());
                     }
@@ -1617,7 +1601,7 @@ fn compose_configuration(
     snapshot: &Snapshot,
     policy: &crate::model::ModePolicy,
 ) -> DisplayResult<Configuration> {
-    requested.validate()?;
+    requested.validate_request_fields()?;
     let active = snapshot.configuration()?;
     let mut selected = requested
         .displays
@@ -1751,7 +1735,7 @@ fn compose_configuration(
             ));
         }
     };
-    configuration.validate()?;
+    configuration.validate_request_fields()?;
     Ok(configuration)
 }
 fn validate_active_ids(configuration: &Configuration, snapshot: &Snapshot) -> DisplayResult<()> {
@@ -1844,7 +1828,7 @@ fn collect_mode_policies(
     mode_policy: Option<crate::model::ModePolicy>,
     mode_policies: Option<Vec<crate::model::ModePolicy>>,
 ) -> DisplayResult<Vec<crate::model::ModePolicy>> {
-    configuration.validate()?;
+    configuration.validate_request_fields()?;
     if mode_policy.is_some() && mode_policies.is_some() {
         return Err(DisplayError::new(
             "invalid_request",

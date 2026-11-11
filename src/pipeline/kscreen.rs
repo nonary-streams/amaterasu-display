@@ -13,7 +13,19 @@ pub(super) fn resolve<P: Platform>(
     expected_revision: Option<&str>,
 ) -> DisplayResult<Configuration> {
     baseline.validate()?;
-    validate_configuration(&configuration, baseline)?;
+    configuration.validate_request_fields()?;
+    for display in &configuration.displays {
+        if !baseline
+            .outputs
+            .iter()
+            .any(|output| output.connected && output.id.eq_ignore_ascii_case(&display.id))
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "selected KScreen output is not connected",
+            ));
+        }
+    }
     let revision = baseline.revision()?;
     if expected_revision.is_some_and(|expected| expected != revision) {
         return Err(DisplayError::new(
@@ -176,6 +188,19 @@ fn compose(
         .displays
         .iter()
         .position(|display| display.id.eq_ignore_ascii_case(target));
+    if option == DisplayConfigurationOption::EnsurePrimary
+        && existing
+            .is_some_and(|index| active.displays[index].x == 0 && active.displays[index].y == 0)
+        && baseline
+            .outputs
+            .iter()
+            .any(|output| output.primary && !output.id.eq_ignore_ascii_case(target))
+    {
+        return Err(DisplayError::new(
+            "unsupported_topology",
+            "changing primary without a desktop origin translation requires explicit primary intent",
+        ));
+    }
     if option == DisplayConfigurationOption::VerifyOnly && existing.is_none() {
         return Err(DisplayError::new(
             "unsupported_display",

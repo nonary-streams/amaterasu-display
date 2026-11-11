@@ -178,6 +178,7 @@ impl Rational {
     }
 }
 impl Configuration {
+    #[cfg(test)]
     pub fn resolve_mode_policy(
         &mut self,
         policy: &ModePolicy,
@@ -335,6 +336,36 @@ impl Configuration {
     }
     pub fn validate(&self) -> Result<(), DisplayError> {
         self.validate_with_scales(None)
+    }
+    /// Validate request fields before topology policy has composed the final
+    /// enabled set. Client mode changes may temporarily overlap saved peers.
+    pub fn validate_request_fields(&self) -> Result<(), DisplayError> {
+        if self.displays.is_empty() || self.displays.len() > MAX_DISPLAYS {
+            return Err(DisplayError::new(
+                "invalid_request",
+                "configuration must contain 1..16 displays",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for display in &self.displays {
+            if !ids.insert(display.id.to_ascii_lowercase())
+                || display.x.abs_diff(0) > 65_536
+                || display.y.abs_diff(0) > 65_536
+            {
+                return Err(DisplayError::new(
+                    "invalid_request",
+                    "invalid display position or duplicate display",
+                ));
+            }
+            let mut single = display.clone();
+            single.x = 0;
+            single.y = 0;
+            Self {
+                displays: vec![single],
+            }
+            .validate()?;
+        }
+        Ok(())
     }
     pub fn validate_kscreen(&self, baseline: &KScreenSnapshot) -> Result<(), DisplayError> {
         baseline.validate()?;
@@ -732,12 +763,12 @@ impl KScreenSnapshot {
         self.validate_topology_configuration(configuration)?;
         let mut expected = self.clone();
         let preserve_priorities = configuration.displays.iter().any(|display| {
-            display.x == 0
-                && display.y == 0
-                && self
-                    .outputs
-                    .iter()
-                    .any(|output| output.primary && output.id.eq_ignore_ascii_case(&display.id))
+            self.outputs.iter().any(|output| {
+                output.primary
+                    && output.id.eq_ignore_ascii_case(&display.id)
+                    && output.position.x == display.x
+                    && output.position.y == display.y
+            })
         });
         let mut used_priorities: BTreeSet<u32> = if preserve_priorities {
             self.outputs
@@ -775,7 +806,13 @@ impl KScreenSnapshot {
                 Rotation::Rotate180 => 4,
                 Rotation::Rotate270 => 8,
             };
-            output.primary = display.x == 0 && display.y == 0;
+            output.primary = if preserve_priorities {
+                self.outputs
+                    .iter()
+                    .any(|saved| saved.primary && saved.id.eq_ignore_ascii_case(&display.id))
+            } else {
+                display.x == 0 && display.y == 0
+            };
             output.priority = if output.primary {
                 1
             } else if preserve_priorities && output.priority > 1 {
