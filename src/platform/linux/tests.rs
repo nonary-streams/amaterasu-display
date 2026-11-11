@@ -1284,3 +1284,121 @@ fn late_authorization_withdrawal_keeps_previous_scanout_after_replacement_activa
         KScreenCommand::Configure(actions) if actions.iter().any(|action| matches!(action, KScreenAction::Enabled { enabled:false, .. }))
     )));
 }
+
+fn configuration_with_managed_peer(connected: bool) -> Value {
+    let mut raw = configuration();
+    let managed = output(
+        "Virtual-1",
+        connected,
+        connected,
+        if connected { "1920x1080@60" } else { "" },
+        (3840, 0),
+        vec![mode("1920x1080@60", 1920, 1080, 60.0)],
+    );
+    raw["outputs"].as_array_mut().unwrap().push(managed);
+    raw
+}
+
+#[test]
+fn normal_physical_transactions_reject_managed_lifecycle_rows_before_effects() {
+    for connected in [false, true] {
+        let raw = configuration_with_managed_peer(connected);
+        let baseline = typed_snapshot_for(&raw);
+        let request = only_hdmi_request(false);
+        let error = baseline
+            .validate_topology_configuration(&request)
+            .unwrap_err();
+        assert_eq!(error.code, "unsupported_topology");
+        assert!(error.message.contains("managed virtual outputs"));
+        let mut runner = FakeKScreenRunner {
+            current: Some(raw),
+            ..Default::default()
+        };
+        let error = topology::apply(&mut runner, &request, &baseline, &mut || Ok(())).unwrap_err();
+        assert_eq!(error.code, "unsupported_topology");
+        assert!(
+            runner
+                .commands
+                .iter()
+                .all(|command| matches!(command, KScreenCommand::Query))
+        );
+    }
+}
+
+#[test]
+fn normal_restore_never_recreates_a_disappeared_managed_peer_from_an_old_baseline() {
+    let baseline_raw = configuration_with_managed_peer(true);
+    let baseline = typed_snapshot_for(&baseline_raw);
+    let mut current = baseline_raw;
+    current["outputs"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|output| output["name"] != "Virtual-1");
+    let mut runner = FakeKScreenRunner {
+        current: Some(current),
+        ..Default::default()
+    };
+    let error = topology::restore(&mut runner, &baseline, &mut || Ok(())).unwrap_err();
+    assert_eq!(error.code, "unsupported_topology");
+    assert!(!error.may_have_changed);
+    assert!(runner.commands.is_empty());
+    assert_eq!(
+        runner.current.as_ref().unwrap()["outputs"][0]["enabled"],
+        true
+    );
+}
+
+#[test]
+fn conservative_normal_guard_preserves_existing_scoped_mixed_topology_support() {
+    let raw = configuration_with_managed_peer(true);
+    let baseline = typed_snapshot_for(&raw);
+    let request: Configuration = serde_json::from_value(
+        configuration_snapshot(&raw, "test").unwrap()["configuration"].clone(),
+    )
+    .unwrap();
+    assert!(baseline.validate_requested_topology(&request).is_ok());
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    apply_scoped_kscreen_snapshot_with(&mut runner, &request, &baseline, None, &mut || Ok(()))
+        .unwrap();
+    assert!(
+        typed_snapshot_for(runner.current.as_ref().unwrap())
+            .matches_configuration(&baseline, &request)
+    );
+}
+
+#[test]
+#[ignore = "requires an attached Wayland/KScreen session and readable DRM identity; read-only"]
+fn current_physical_kscreen_inventory_has_recoverable_monitor_identities() {
+    let raw = query_configuration().unwrap();
+    let snapshot = typed_snapshot_for(&raw);
+    let physical: Vec<_> = snapshot
+        .outputs
+        .iter()
+        .filter(|output| {
+            output.connected && !output.id.to_ascii_lowercase().starts_with("virtual-")
+        })
+        .collect();
+    assert!(
+        !physical.is_empty(),
+        "no connected physical output was observed"
+    );
+    assert!(
+        physical
+            .iter()
+            .all(|output| output.hardware_identity.is_some()),
+        "every connected physical output needs an unambiguous observed identity"
+    );
+    let fresh = query_configuration().unwrap();
+    let fresh_snapshot = typed_snapshot_for(&fresh);
+    for output in physical {
+        let current = fresh_snapshot
+            .outputs
+            .iter()
+            .find(|current| current.id == output.id)
+            .expect("physical output disappeared during read-only qualification");
+        assert_eq!(output.hardware_identity, current.hardware_identity);
+    }
+}

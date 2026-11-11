@@ -43,6 +43,7 @@ fn plan(
     current: &Value,
     explicit_hdr: &BTreeSet<String>,
 ) -> DisplayResult<Vec<KScreenAction>> {
+    expected.validate_physical_topology_inventory()?;
     let current_snapshot = typed_snapshot(&validated_outputs(current)?)?;
     unchanged_connectors(expected, &current_snapshot)?;
     if !expected
@@ -259,6 +260,71 @@ fn survivors_match(expected: &KScreenSnapshot, observed: &KScreenSnapshot) -> bo
         })
 }
 
+fn has_hdr_activation(actions: &[KScreenAction], output_id: &str) -> bool {
+    actions.iter().any(|action| {
+        if let KScreenAction::Hdr { output, enabled } = action {
+            *enabled && output.eq_ignore_ascii_case(output_id)
+        } else {
+            false
+        }
+    })
+}
+
+fn state_before_hdr_activation(
+    expected: &KScreenSnapshot,
+    observed: &KScreenSnapshot,
+    actions: &[KScreenAction],
+) -> KScreenSnapshot {
+    let mut before_hdr = expected.clone();
+    for output in &mut before_hdr.outputs {
+        if has_hdr_activation(actions, &output.id) {
+            output.hdr_enabled = observed
+                .outputs
+                .iter()
+                .find(|present| present.id.eq_ignore_ascii_case(&output.id))
+                .and_then(|present| present.hdr_enabled);
+        }
+    }
+    before_hdr
+}
+
+fn observe_after_mutation(
+    runner: &mut impl KScreenCommandRunner,
+) -> DisplayResult<KScreenSnapshot> {
+    let raw = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
+    let outputs = validated_outputs(&raw).map_err(DisplayError::after_mutation)?;
+    typed_snapshot(&outputs).map_err(DisplayError::after_mutation)
+}
+
+fn retire_previous_scanouts(
+    runner: &mut impl KScreenCommandRunner,
+    expected: &KScreenSnapshot,
+    mut retirement: Vec<KScreenAction>,
+    guard: &mut dyn FnMut() -> DisplayResult<()>,
+) -> DisplayResult<()> {
+    if retirement.is_empty() {
+        return Ok(());
+    }
+    let survivors = observe_after_mutation(runner)?;
+    if !survivors_match(expected, &survivors) {
+        return Err(DisplayError::new(
+            "verification_failed",
+            "replacement display was not independently ready before retiring the previous scanout",
+        )
+        .after_mutation());
+    }
+    guard().map_err(DisplayError::after_mutation)?;
+    // KWin can renumber priorities while a retiring output still occupies
+    // a slot. Reassert the saved desired ordering in the final transaction.
+    for output in expected.outputs.iter().filter(|output| output.enabled) {
+        retirement.push(KScreenAction::Priority {
+            output: output.id.clone(),
+            priority: output.priority,
+        });
+    }
+    run_configuration_with(runner, retirement)
+}
+
 fn execute(
     runner: &mut impl KScreenCommandRunner,
     expected: &KScreenSnapshot,
@@ -267,41 +333,15 @@ fn execute(
     guard: &mut dyn FnMut() -> DisplayResult<()>,
 ) -> DisplayResult<()> {
     let observed = typed_snapshot(&validated_outputs(current)?)?;
-    let mut before_hdr = expected.clone();
-    for output in &mut before_hdr.outputs {
-        if actions.iter().any(|action| matches!(action,KScreenAction::Hdr{output:name,enabled:true} if name.eq_ignore_ascii_case(&output.id))) {
-            output.hdr_enabled=observed.outputs.iter().find(|present|present.id.eq_ignore_ascii_case(&output.id)).and_then(|present|present.hdr_enabled);
-        }
-    }
-    let (mut retirement, activation): (Vec<_>, Vec<_>) = actions
+    let before_hdr = state_before_hdr_activation(expected, &observed, &actions);
+    let (retirement, activation): (Vec<_>, Vec<_>) = actions
         .into_iter()
         .partition(|action| matches!(action, KScreenAction::Enabled { enabled: false, .. }));
     configure_before_hdr_activation(runner, activation, guard, |observed| {
         survivors_match(&before_hdr, observed)
     })?;
-    if !retirement.is_empty() {
-        let current = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
-        let survivors =
-            typed_snapshot(&validated_outputs(&current).map_err(DisplayError::after_mutation)?)
-                .map_err(DisplayError::after_mutation)?;
-        if !survivors_match(expected, &survivors) {
-            return Err(DisplayError::new("verification_failed","replacement display was not independently ready before retiring the previous scanout").after_mutation());
-        }
-        guard().map_err(DisplayError::after_mutation)?;
-        // KWin can renumber priorities while a retiring output still occupies
-        // a slot. Reassert the saved desired ordering in the final transaction.
-        for output in expected.outputs.iter().filter(|output| output.enabled) {
-            retirement.push(KScreenAction::Priority {
-                output: output.id.clone(),
-                priority: output.priority,
-            });
-        }
-        run_configuration_with(runner, retirement)?;
-    }
-    let after = query_configuration_with(runner).map_err(DisplayError::after_mutation)?;
-    let observed =
-        typed_snapshot(&validated_outputs(&after).map_err(DisplayError::after_mutation)?)
-            .map_err(DisplayError::after_mutation)?;
+    retire_previous_scanouts(runner, expected, retirement, guard)?;
+    let observed = observe_after_mutation(runner)?;
     if !expected.matches_topology_restoration(&observed) {
         return Err(DisplayError::new(
             "verification_failed",
@@ -317,7 +357,7 @@ pub(super) fn restore(
     baseline: &KScreenSnapshot,
     guard: &mut dyn FnMut() -> DisplayResult<()>,
 ) -> DisplayResult<()> {
-    baseline.validate()?;
+    baseline.validate_physical_topology_inventory()?;
     guard()?;
     let before = query_configuration_with(runner)?;
     let observed = typed_snapshot(&validated_outputs(&before)?)?;

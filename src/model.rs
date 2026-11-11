@@ -651,13 +651,43 @@ impl KScreenSnapshot {
         Ok(format!("{first:016x}{second:016x}"))
     }
 
+    /// A physical restore lease cannot adopt a managed connector's lifecycle.
+    /// Until a merged physical/virtual ownership transaction exists, reject
+    /// inventories containing managed-name rows, including disconnected pool
+    /// entries, before persisting a normal physical recovery baseline. This is
+    /// conservative admission only; connector names never authorize mutation.
+    pub fn validate_physical_topology_inventory(&self) -> Result<(), DisplayError> {
+        self.validate()?;
+        if self
+            .outputs
+            .iter()
+            .any(|output| output.id.to_ascii_lowercase().starts_with("virtual-"))
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "normal physical topology cannot include managed virtual outputs; use their owning scoped session",
+            ));
+        }
+        if !self
+            .outputs
+            .iter()
+            .any(|output| output.connected && output.enabled)
+        {
+            return Err(DisplayError::new(
+                "unsupported_topology",
+                "normal physical topology requires a usable saved physical output",
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate a complete desired enabled-output set against a saved native
     /// inventory. Scoped composition continues to use its stricter validator.
     pub fn validate_topology_configuration(
         &self,
         configuration: &Configuration,
     ) -> Result<(), DisplayError> {
-        self.validate()?;
+        self.validate_physical_topology_inventory()?;
         if self
             .outputs
             .iter()
