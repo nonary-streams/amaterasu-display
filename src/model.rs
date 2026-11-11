@@ -907,6 +907,7 @@ impl KScreenSnapshot {
         })
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub fn validate_requested_topology(
         &self,
         configuration: &Configuration,
@@ -947,6 +948,7 @@ impl KScreenSnapshot {
         Ok(())
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub fn scoped_primary_baseline(&self, target_id: &str) -> Result<Self, DisplayError> {
         self.validate()?;
         let target = self
@@ -973,6 +975,7 @@ impl KScreenSnapshot {
         Ok(expected)
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub fn matches_configuration(&self, baseline: &Self, configuration: &Configuration) -> bool {
         if self.validate_requested_topology(configuration).is_err()
             || baseline.validate_requested_topology(configuration).is_err()
