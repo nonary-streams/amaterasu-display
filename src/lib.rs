@@ -60,4 +60,9 @@ impl ManagedModule for DisplayModule {
             .tick(|command| self.runtime.send_ephemeral(command))
     }
 }
-amaterasu_module_sdk::export_module!(DisplayModule);
+// Native display APIs and KScreen commands may wait for mode publication.
+// Keep the complete durable transaction on one serialized worker; host ticks
+// only wake it, and worker retirement precedes unloading its native library.
+amaterasu_module_sdk::export_module!(
+    amaterasu_module_sdk::service_worker::ServiceWorker<DisplayModule>
+);
