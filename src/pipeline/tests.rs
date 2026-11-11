@@ -1495,19 +1495,38 @@ fn disabled_configuration_option_has_no_state_or_native_effect_even_when_mutatio
 }
 
 #[test]
-fn verify_only_requires_active_target_without_journal_or_mode_resolution() {
+fn verify_only_applies_mode_policy_and_restores_active_target() {
     let mut state = State::default();
-    let mut pipeline = Pipeline::new(FakePlatform::default(), false);
-    let reply = state.run(
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let mut request = configuration_option_request("verify_only", "monitor.one", configuration());
+    request["mode_policy"]["manual_resolution"] = json!("1920x1080");
+    let reply = state.run(&mut pipeline, "owner", request);
+    assert_eq!(reply["applied"], true);
+    assert_eq!(
+        pipeline.platform.applied_mode,
+        Some((
+            1920,
+            1080,
+            Rational {
+                numerator: 60,
+                denominator: 1
+            }
+        ))
+    );
+    assert!(state.journal.is_some());
+    let restored = state.run(
         &mut pipeline,
         "owner",
-        configuration_option_request("verify_only", "monitor.one", configuration()),
+        json!({"action":"restore","lease":reply["lease"]}),
     );
-    assert_eq!(reply["verified"], true);
-    assert_eq!(reply["applied"], false);
-    assert!(reply["lease"].is_null());
-    assert_eq!(state.revision, 0);
-    assert!(pipeline.platform.prepared_modes.is_empty());
+    assert_eq!(restored["restored"], true);
+    assert!(state.journal.is_none());
+}
+
+#[test]
+fn verify_only_rejects_inactive_target_before_journal_or_native_effect() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
     let mut inactive = snapshot();
     inactive.paths[0].id = "monitor.other".into();
     pipeline.platform.current_snapshot = Some(inactive);
@@ -1518,6 +1537,75 @@ fn verify_only_requires_active_target_without_journal_or_mode_resolution() {
     );
     assert_eq!(rejected["error"]["code"], "unsupported_display");
     assert_eq!(state.revision, 0);
+    assert!(pipeline.platform.effects.is_empty());
+}
+
+#[test]
+fn verify_only_applies_hdr_without_activating_an_output() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let mut request = hdr_apply("auto", Some(true));
+    request["mode_policy"]["configuration_option"] = json!("verify_only");
+    let reply = state.run(&mut pipeline, "owner", request);
+    assert_eq!(reply["applied"], true);
+    assert!(pipeline.platform.hdr_state);
+    assert_eq!(pipeline.platform.hdr_mutations, 1);
+    let restored = state.run(
+        &mut pipeline,
+        "owner",
+        json!({"action":"restore","lease":reply["lease"]}),
+    );
+    assert_eq!(restored["restored"], true);
+    assert!(!pipeline.platform.hdr_state);
+}
+
+#[test]
+fn verify_only_retains_peer_settings_and_selected_position() {
+    let mut state = State::default();
+    let baseline = two_display_snapshot();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            current_snapshot: Some(baseline.clone()),
+            hdr_supported: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let request = json!({
+        "action":"apply",
+        "configuration":baseline.configuration().unwrap(),
+        "expected_topology_revision":baseline.revision().unwrap(),
+        "mode_policy":{
+            "display_id":"monitor.two",
+            "configuration_option":"verify_only",
+            "context":{"resolution_is_automatic":false,"refresh_rate_is_automatic":false,
+                "client_display_mode_override":false,"optimize_game_settings":false},
+            "remapping":{},"refresh_rate_option":"manual","manual_refresh_rate":"75"
+        }
+    });
+    let reply = state.run(&mut pipeline, "owner", request);
+    assert_eq!(reply["applied"], true, "{reply}");
+    let applied = pipeline.platform.prepared_configuration.as_ref().unwrap();
+    let before = baseline.configuration().unwrap();
+    assert!(crate::scoped::same_setting(
+        &before.displays[0],
+        &applied.displays[0]
+    ));
+    assert_eq!(applied.displays[1].x, before.displays[1].x);
+    assert_eq!(applied.displays[1].y, before.displays[1].y);
+    assert_eq!(
+        applied.displays[1].refresh,
+        Rational {
+            numerator: 75,
+            denominator: 1
+        }
+    );
 }
 
 #[test]
@@ -3102,6 +3190,50 @@ fn remapped_mode_reaches_prepare_and_durable_apply() {
 }
 
 #[test]
+fn remapping_uses_stream_fps_after_display_refresh_promotion() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let mut requested = configuration();
+    requested["displays"][0]["refresh"] = json!({"numerator":240,"denominator":1});
+    let result = state.run(
+        &mut pipeline,
+        "owner",
+        json!({
+            "action":"apply",
+            "configuration":requested,
+            "mode_policy":{
+                "display_id":"monitor.one",
+                "client_fps":60,
+                "context":{
+                    "resolution_is_automatic":true,
+                    "refresh_rate_is_automatic":true,
+                    "client_display_mode_override":false,
+                    "optimize_game_settings":false
+                },
+                "remapping":{"mixed":[{
+                    "requested_resolution":"1280x720",
+                    "requested_fps":"60",
+                    "final_resolution":"1920x1080",
+                    "final_refresh_rate":"119.95"
+                }]}
+            }
+        }),
+    );
+    assert_eq!(result["applied"], true);
+    let expected = Some((
+        1920,
+        1080,
+        Rational {
+            numerator: 11_995,
+            denominator: 100,
+        },
+    ));
+    assert_eq!(pipeline.platform.prepared_mode, expected);
+    assert_eq!(pipeline.platform.applied_mode, expected);
+    assert!(state.journal.is_some());
+}
+
+#[test]
 fn unsupported_virtual_layout_rejects_mode_and_hdr_policy_before_journal_or_native_effect() {
     let mut state = State::default();
     let mut pipeline = Pipeline::new(
@@ -3486,8 +3618,8 @@ fn highest_refresh_uses_final_resolution_and_reaches_durable_apply() {
         1920,
         1080,
         Rational {
-            numerator: 120000,
-            denominator: 1001,
+            numerator: 120,
+            denominator: 1,
         },
     ));
     assert_eq!(pipeline.platform.mode_queries, 2);
@@ -3701,7 +3833,7 @@ fn inactive_display_rejects_highest_before_prepare_and_journal() {
     assert!(state.journal.is_none());
 }
 #[test]
-fn disabled_optimization_keeps_concrete_resolution() {
+fn manual_resolution_applies_without_client_optimization() {
     let mut state = State::default();
     let mut pipeline = Pipeline::new(FakePlatform::default(), true);
     let result = state.run(
@@ -3720,7 +3852,7 @@ fn disabled_optimization_keeps_concrete_resolution() {
                 },
                 "remapping":{},
                 "resolution_option":"manual",
-                "manual_resolution":"malformed"
+                "manual_resolution":"1920x1080"
             }
         }),
     );
@@ -3728,8 +3860,8 @@ fn disabled_optimization_keeps_concrete_resolution() {
     assert_eq!(
         pipeline.platform.applied_mode,
         Some((
-            1280,
-            720,
+            1920,
+            1080,
             Rational {
                 numerator: 60,
                 denominator: 1

@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DisplayConfigurationOption {
-    /// Require the selected display to be active without changing display state.
+    /// Require the selected display to be active while applying mode and HDR
+    /// policy without activating, deactivating or reprioritizing outputs.
     #[default]
     VerifyOnly,
     /// Do not perform additional display configuration.

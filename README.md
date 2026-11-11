@@ -96,17 +96,17 @@ tokens are `disabled`, `verify_only`, `ensure_active`, `ensure_primary`, and
 
 - `disabled` performs no additional display configuration and disables the
   other `dd_` display options.
-- `verify_only` requires the selected display to be active without changing
-  display state.
+- `verify_only` requires the selected display to be active, then applies its
+  resolution, refresh and HDR policy while preserving the active topology.
 - `ensure_active` activates the selected display if it is inactive.
 - `ensure_primary` activates the selected display if it is inactive and makes
   it primary.
 - `ensure_only_display` activates the selected display if it is inactive and
   disables other displays.
 
-The pinned reference covers Windows and Linux private displays managed through
-KScreen. It does not specify a Moonlight gate for this option; the Moonlight
-"Optimize game settings" prerequisite belongs to `dd_resolution_option`. The
+The reference covers Windows and Linux private displays managed through
+KScreen. Display preparation and mode selection are independent of Moonlight's
+"Optimize game settings" preference. The
 public enum itself has no persistence, scoped-value projection, runtime or
 provider display effects, management UI readback, or platform qualification.
 macOS behavior remains unqualified.
@@ -123,10 +123,17 @@ are:
 - `disabled` performs no additional resolution configuration.
 - `manual` uses the separate `dd_manual_resolution` setting.
 
-Moonlight requires `Optimize game settings` to be enabled for this option to work.
-This module exposes the model only; it does not persist settings, project scoped
-values into runtime requests, perform provider effects, or implement the
-Moonlight gate.
+Automatic and manual resolution selection, including resolution remapping,
+remain active when `Optimize game settings` is disabled. The legacy context
+field is accepted for compatibility and does not gate display policy. Callers
+provide their effective client resolution and higher-priority client mode
+override; provider policy resolves the requested mode before native preparation.
+
+Mode policies may include `client_fps` to select `requested_fps` remapping rules
+using the original stream rate, independently of a higher requested physical
+display refresh. Older callers that omit the field retain matching against the
+concrete request refresh. Explicit client display-mode overrides bypass all
+remapping.
 
 ## API
 

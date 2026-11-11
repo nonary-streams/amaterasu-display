@@ -39,8 +39,9 @@ pub struct DisplayMode {
 /// Runtime facts that control which remapping list may apply.
 ///
 /// Callers must provide these explicitly because option selection, client mode
-/// overrides, and the client's "Optimize game settings" choice are not config
-/// defaults owned by this policy.
+/// overrides are not config defaults owned by this policy. The legacy
+/// optimization field is retained for request compatibility; display policy
+/// does not depend on the client's encoder optimization preference.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolverContext {
@@ -90,6 +91,17 @@ impl ModeRemapping {
         context: ResolverContext,
         requested_mode: DisplayMode,
     ) -> Result<DisplayMode, ModeRemappingError> {
+        self.resolve_with_client_fps(context, requested_mode, None)
+    }
+
+    /// Select rules using streamed FPS independently of the requested display
+    /// refresh. Older callers without that session fact retain refresh matching.
+    pub fn resolve_with_client_fps(
+        &self,
+        context: ResolverContext,
+        requested_mode: DisplayMode,
+        client_fps: Option<u32>,
+    ) -> Result<DisplayMode, ModeRemappingError> {
         if context.client_display_mode_override {
             return Ok(requested_mode);
         }
@@ -106,15 +118,6 @@ impl ModeRemapping {
             };
 
         for (entry_index, entry) in entries.iter().enumerate() {
-            // The pinned configuration contract gates rules that use resolution
-            // fields on the explicit client-side optimization setting.
-            if !context.optimize_game_settings
-                && (!entry.requested_resolution.trim().is_empty()
-                    || !entry.final_resolution.trim().is_empty())
-            {
-                continue;
-            }
-
             let parsed = parse_entry(kind, entry, entry_index)?;
             if parsed.final_resolution.is_none() && parsed.final_refresh_rate.is_none() {
                 return Err(ModeRemappingError::MissingFinalOutput { entry_index });
@@ -124,8 +127,12 @@ impl ModeRemapping {
                 .requested_resolution
                 .is_some_and(|resolution| Some(resolution) != requested_mode.resolution)
                 || parsed.requested_fps.is_some_and(|rate| {
-                    !requested_mode
-                        .refresh_rate
+                    !client_fps
+                        .map(|numerator| Rational {
+                            numerator,
+                            denominator: 1,
+                        })
+                        .or(requested_mode.refresh_rate)
                         .is_some_and(|v| rational_equal(rate, v))
                 })
             {
@@ -477,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_game_settings_gates_resolution_rules_but_keeps_rate_rules() {
+    fn resolution_remapping_is_independent_of_client_optimization() {
         let remapping = ModeRemapping {
             mixed: vec![
                 ModeRemappingEntry {
@@ -498,7 +505,7 @@ mod tests {
 
         assert_eq!(
             remapping.resolve(context(true, true, false), requested),
-            Ok(mode(1920, 1080, 90, 1))
+            Ok(mode(2560, 1440, 120, 1))
         );
         assert_eq!(
             remapping.resolve(context(true, true, true), requested),
@@ -507,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_resolution_rule_is_ignored_when_optimization_is_disabled() {
+    fn malformed_resolution_rule_is_rejected_without_client_optimization() {
         let remapping = ModeRemapping {
             mixed: vec![
                 ModeRemappingEntry {
@@ -528,7 +535,36 @@ mod tests {
 
         assert_eq!(
             remapping.resolve(context(true, true, false), requested),
-            Ok(mode(1920, 1080, 90, 1))
+            Err(ModeRemappingError::InvalidField {
+                entry_index: 0,
+                field: "final_resolution"
+            })
+        );
+    }
+
+    #[test]
+    fn requested_fps_matches_stream_rate_before_display_refresh_promotion() {
+        let remapping = ModeRemapping {
+            mixed: vec![ModeRemappingEntry {
+                requested_resolution: "1920x1080".into(),
+                requested_fps: "60".into(),
+                final_refresh_rate: "119.95".into(),
+                ..ModeRemappingEntry::default()
+            }],
+            ..ModeRemapping::default()
+        };
+        let promoted = mode(1920, 1080, 240, 1);
+        assert_eq!(
+            remapping.resolve_with_client_fps(context(true, true, false), promoted, Some(60)),
+            Ok(mode(1920, 1080, 11_995, 100))
+        );
+        assert_eq!(
+            remapping.resolve_with_client_fps(context(true, true, false), promoted, Some(120)),
+            Ok(promoted)
+        );
+        assert_eq!(
+            remapping.resolve(context(true, true, false), promoted),
+            Ok(promoted)
         );
     }
 }

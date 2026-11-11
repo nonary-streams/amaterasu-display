@@ -106,6 +106,10 @@ pub struct ModePolicy {
     pub configuration_option: Option<DisplayConfigurationOption>,
     pub remapping: ModeRemapping,
     pub context: ResolverContext,
+    /// Original streamed FPS used to select remapping rules, before physical
+    /// display refresh promotion. Omitted by legacy callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_fps: Option<u32>,
     #[serde(default)]
     pub resolution_option: Option<ResolutionOption>,
     #[serde(default)]
@@ -212,7 +216,7 @@ impl Configuration {
         if !context.client_display_mode_override {
             if let Some(option) = policy.resolution_option {
                 context.resolution_is_automatic = option.is_automatic();
-                let manual = if context.optimize_game_settings {
+                let manual = if option == ResolutionOption::Manual {
                     ManualResolution::parse(policy.manual_resolution.as_deref().unwrap_or_default())
                         .map_err(|error| DisplayError::new("invalid_request", error.to_string()))?
                 } else {
@@ -258,7 +262,7 @@ impl Configuration {
         }
         let mut resolved = policy
             .remapping
-            .resolve(context, selected)
+            .resolve_with_client_fps(context, selected, policy.client_fps)
             .map_err(|error| {
                 DisplayError::new(
                     "invalid_request",
@@ -283,17 +287,12 @@ impl Configuration {
                 })
                 .filter(|mode| mode.refresh.denominator != 0 && mode.refresh.numerator != 0)
                 .max_by(|left, right| {
-                    left.nominal_refresh_hz
-                        .cmp(&right.nominal_refresh_hz)
+                    (u64::from(left.refresh.numerator) * u64::from(right.refresh.denominator))
+                        .cmp(
+                            &(u64::from(right.refresh.numerator)
+                                * u64::from(left.refresh.denominator)),
+                        )
                         .then_with(|| left.exact_current.cmp(&right.exact_current))
-                        .then_with(|| {
-                            (u64::from(left.refresh.numerator)
-                                * u64::from(right.refresh.denominator))
-                            .cmp(
-                                &(u64::from(right.refresh.numerator)
-                                    * u64::from(left.refresh.denominator)),
-                            )
-                        })
                 })
                 .ok_or_else(|| {
                     DisplayError::new(

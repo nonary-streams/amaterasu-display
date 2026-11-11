@@ -180,7 +180,7 @@ impl<P: Platform> Pipeline<P> {
                 || expected_mutation_domain_revision.is_some())
             && matches!(
                 policy.configuration_option,
-                Some(DisplayConfigurationOption::Disabled | DisplayConfigurationOption::VerifyOnly)
+                Some(DisplayConfigurationOption::Disabled)
             )
         {
             return complete(
@@ -194,22 +194,16 @@ impl<P: Platform> Pipeline<P> {
         }
         if let Operation::Apply {
             configuration,
-            expected_topology_revision,
             mode_policy: Some(policy),
             mode_policies: None,
             ..
         } = &incoming.operation
             && matches!(
                 policy.configuration_option,
-                Some(DisplayConfigurationOption::Disabled | DisplayConfigurationOption::VerifyOnly)
+                Some(DisplayConfigurationOption::Disabled)
             )
         {
-            let result = read_only_apply(
-                &mut self.platform,
-                configuration,
-                policy,
-                expected_topology_revision.as_deref(),
-            );
+            let result = disabled_apply(configuration, policy);
             return complete(
                 send,
                 incoming.context.request,
@@ -676,6 +670,36 @@ impl<P: Platform> Pipeline<P> {
                 let mut native_target = None;
                 let mut pending_route = None;
                 let mut clone_baseline = None;
+                if topology_option == Some(DisplayConfigurationOption::VerifyOnly) {
+                    let snapshot = match self.platform.snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                    if !snapshot.paths.iter().any(|path| {
+                        mode_policy
+                            .as_ref()
+                            .is_some_and(|policy| path.id.eq_ignore_ascii_case(&policy.display_id))
+                    }) {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "unsupported_display",
+                                "verify_only requires an active display",
+                            ),
+                        );
+                    }
+                    let policy = mode_policy.as_ref().expect("selected topology policy");
+                    configuration = match compose_configuration(&configuration, &snapshot, policy) {
+                        Ok(configuration) => configuration,
+                        Err(error) => return complete(send, context.request, error.payload()),
+                    };
+                    if snapshot.paths.len() > 1 {
+                        native_target =
+                            Some((policy.display_id.clone(), TopologyShape::PreserveActive));
+                    }
+                    clone_baseline = Some(snapshot);
+                }
                 if topology_change {
                     let Some(expected) = expected_topology_revision.as_deref() else {
                         return complete(
@@ -1522,11 +1546,9 @@ fn verify_kscreen_configuration<P: Platform>(
     Ok(())
 }
 
-fn read_only_apply<P: Platform>(
-    platform: &mut P,
+fn disabled_apply(
     configuration: &Configuration,
     policy: &crate::model::ModePolicy,
-    expected_revision: Option<&str>,
 ) -> DisplayResult<Value> {
     configuration.validate()?;
     if !configuration
@@ -1539,30 +1561,7 @@ fn read_only_apply<P: Platform>(
             "mode policy display is not in the configuration",
         ));
     }
-    if policy.configuration_option == Some(DisplayConfigurationOption::Disabled) {
-        return Ok(json!({"ok":true,"applied":false,"configuration_option":"disabled"}));
-    }
-    let snapshot = platform.snapshot()?;
-    snapshot.configuration()?;
-    if let Some(expected) = expected_revision
-        && snapshot.revision()? != expected
-    {
-        return Err(DisplayError::new(
-            "topology_changed",
-            "active display topology changed before verification",
-        ));
-    }
-    if !snapshot
-        .paths
-        .iter()
-        .any(|path| path.id.eq_ignore_ascii_case(&policy.display_id))
-    {
-        return Err(DisplayError::new(
-            "unsupported_display",
-            "verify_only requires an active display",
-        ));
-    }
-    Ok(json!({"ok":true,"applied":false,"verified":true,"configuration_option":"verify_only"}))
+    Ok(json!({"ok":true,"applied":false,"configuration_option":"disabled"}))
 }
 fn physical_revision(snapshot: &Snapshot) -> DisplayResult<String> {
     let mut physical = snapshot.clone();
@@ -1631,7 +1630,9 @@ fn compose_configuration(
     // Active targets can use the saved CCD route for every untouched monitor.
     let configuration = match policy.configuration_option {
         Some(
-            DisplayConfigurationOption::EnsureActive | DisplayConfigurationOption::EnsurePrimary,
+            DisplayConfigurationOption::VerifyOnly
+            | DisplayConfigurationOption::EnsureActive
+            | DisplayConfigurationOption::EnsurePrimary,
         ) if existing.is_some() => {
             let index = existing.expect("checked active selected target");
             let mut configuration = active;

@@ -137,20 +137,16 @@ impl std::error::Error for ResolutionOptionError {}
 /// policy: it does not resolve app or client settings, persist configuration,
 /// serialize requests, or call a display provider.
 ///
-/// When Moonlight Optimize game settings is disabled, no option selects an
-/// additional resolution. Automatic selection uses the already-validated
-/// client-requested resolution; manual selection uses the specified manual
-/// resolution, including zero dimensions if they were accepted by its parser.
+/// Automatic selection uses the already-validated client-requested resolution;
+/// manual selection uses the specified manual resolution. The legacy client
+/// optimization argument is retained for callers, but does not gate display
+/// policy. Zero dimensions are preserved for the complete request validator.
 pub fn select_additional_resolution(
     option: ResolutionOption,
     manual_resolution: ManualResolution,
     client_resolution: Option<Resolution>,
-    optimize_game_settings: bool,
+    _optimize_game_settings: bool,
 ) -> Result<Option<Resolution>, ResolutionOptionError> {
-    if !optimize_game_settings {
-        return Ok(None);
-    }
-
     match option {
         ResolutionOption::Disabled => Ok(None),
         ResolutionOption::Auto => client_resolution
@@ -260,18 +256,38 @@ mod tests {
     }
 
     #[test]
-    fn optimize_gate_bypasses_every_resolution_option() {
-        for option in [
-            ResolutionOption::Auto,
-            ResolutionOption::Disabled,
-            ResolutionOption::Manual,
-        ] {
-            assert_eq!(
-                select_additional_resolution(option, ManualResolution::Unspecified, None, false,),
-                Ok(None),
-                "unexpected result for {option:?}"
-            );
-        }
+    fn resolution_policy_is_independent_of_client_optimization() {
+        let resolution = Resolution {
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Auto,
+                ManualResolution::Unspecified,
+                Some(resolution),
+                false
+            ),
+            Ok(Some(resolution))
+        );
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Manual,
+                ManualResolution::Specified(resolution),
+                None,
+                false
+            ),
+            Ok(Some(resolution))
+        );
+        assert_eq!(
+            select_additional_resolution(
+                ResolutionOption::Manual,
+                ManualResolution::Unspecified,
+                None,
+                false
+            ),
+            Err(ResolutionOptionError::MissingManualResolution)
+        );
     }
 
     #[test]
