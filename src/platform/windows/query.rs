@@ -39,7 +39,7 @@ pub fn query(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> DisplayResult<ConfigurationBu
             unsafe { GetDisplayConfigBufferSizes(flags, &mut paths, &mut modes) } as i32,
             "GetDisplayConfigBufferSizes",
         )?;
-        if paths > 256 || modes > 1024 {
+        if !configuration_sizes_valid(flags, paths, modes) {
             return Err(DisplayError::new(
                 "resource_exhausted",
                 "display configuration exceeds bounded native buffers",
@@ -79,6 +79,17 @@ pub fn query(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> DisplayResult<ConfigurationBu
         "topology_changed",
         "display topology changed repeatedly during enumeration",
     ))
+}
+
+fn configuration_sizes_valid(flags: QUERY_DISPLAY_CONFIG_FLAGS, paths: u32, modes: u32) -> bool {
+    // ALL_PATHS enumerates candidate source/target combinations, not monitors.
+    // Multi-source adapters can exceed the active desktop limit with few outputs.
+    let (path_limit, mode_limit) = if flags & QDC_ALL_PATHS != 0 {
+        (8192, 32768)
+    } else {
+        (256, 1024)
+    };
+    paths <= path_limit && modes <= mode_limit
 }
 
 pub fn names(path: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<DeviceNames> {
@@ -348,21 +359,19 @@ fn unique_active_target<'a>(
 pub fn snapshot() -> DisplayResult<Snapshot> {
     let buffers = query(QDC_ONLY_ACTIVE_PATHS)?;
     check_virtual_layout(&buffers)?;
+    snapshot_from_buffers(&buffers, names, advanced_color_enabled)
+}
+
+pub(super) fn snapshot_from_buffers(
+    buffers: &ConfigurationBuffers,
+    mut resolve_names: impl FnMut(&DISPLAYCONFIG_PATH_INFO) -> DisplayResult<DeviceNames>,
+    mut read_hdr: impl FnMut(&DISPLAYCONFIG_PATH_INFO) -> DisplayResult<Option<bool>>,
+) -> DisplayResult<Snapshot> {
     let mut paths = Vec::new();
     for path in &buffers.paths {
-        if matches!(
-            path.targetInfo.outputTechnology,
-            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST
-        ) {
-            return Err(DisplayError::new(
-                "unsupported_display",
-                "indirect and wireless displays require a dedicated adapter",
-            ));
-        }
-        let mut decoded = decode_path(path, &buffers.modes, names(path)?)?;
-        decoded.hdr_enabled = advanced_color_enabled(path)?;
+        super::require_restorable_output(path.targetInfo.outputTechnology, "unsupported_display")?;
+        let mut decoded = decode_path(path, &buffers.modes, resolve_names(path)?)?;
+        decoded.hdr_enabled = read_hdr(path)?;
         paths.push(decoded);
     }
     let snapshot = Snapshot {
@@ -712,6 +721,36 @@ mod tests {
             modes,
         };
         (legacy, aware)
+    }
+
+    #[test]
+    fn all_path_inventory_allows_many_candidate_routes_without_unbounded_allocation() {
+        use windows_sys::Win32::Devices::Display::{QDC_ALL_PATHS, QDC_ONLY_ACTIVE_PATHS};
+        assert!(super::configuration_sizes_valid(QDC_ALL_PATHS, 512, 2048));
+        assert!(!super::configuration_sizes_valid(
+            QDC_ONLY_ACTIVE_PATHS,
+            512,
+            2048
+        ));
+        assert!(!super::configuration_sizes_valid(QDC_ALL_PATHS, 8193, 2048));
+        assert!(!super::configuration_sizes_valid(QDC_ALL_PATHS, 512, 32769));
+    }
+
+    #[test]
+    fn wired_indirect_virtual_aware_layout_still_requires_exact_compatible_records() {
+        use windows_sys::Win32::Devices::Display::DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+        let (mut legacy, mut aware) = compatible_virtual_buffers();
+        legacy.paths[0].targetInfo.outputTechnology =
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+        aware.paths[0].targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+        super::validate_virtual_layout(&legacy, &aware).unwrap();
+        aware.paths[0].targetInfo.Anonymous.modeInfoIdx = 0x0001_0002;
+        assert_eq!(
+            super::validate_virtual_layout(&legacy, &aware)
+                .unwrap_err()
+                .code,
+            "unsupported_topology"
+        );
     }
 
     #[test]

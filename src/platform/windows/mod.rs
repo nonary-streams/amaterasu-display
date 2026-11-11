@@ -11,6 +11,26 @@ use crate::model::{
 use serde_json::{Value, json};
 use std::time::Duration;
 
+// Wired indirect displays expose the same exact CCD target/source records as
+// physical outputs. Their ownership stays with the selected virtual provider;
+// this adapter only mutates a concrete device-interface identity. Remote and
+// indirect virtual transports still need their own recovery representation.
+fn require_restorable_output(technology: i32, code: &'static str) -> DisplayResult<()> {
+    use windows_sys::Win32::Devices::Display::{
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL, DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST,
+    };
+    if matches!(
+        technology,
+        DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST
+    ) {
+        return Err(DisplayError::new(
+            code,
+            "wireless and indirect virtual routes require a dedicated display adapter",
+        ));
+    }
+    Ok(())
+}
+
 const CCD_SETTLE_ATTEMPTS: usize = 6;
 const CCD_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -63,7 +83,9 @@ fn reject_foreign_apply_state(
             .iter()
             .find(|saved| saved.id.eq_ignore_ascii_case(&path.id))
         {
-            if path.target_address != saved.target_address || path.source_name != saved.source_name
+            if path.target_address != saved.target_address
+                || path.source_name != saved.source_name
+                || path.output_technology != saved.output_technology
             {
                 return Err(DisplayError::new(
                     "topology_changed",
@@ -79,6 +101,7 @@ fn reject_foreign_apply_state(
                     || bound.target_address != path.target_address
                     || bound.source_address != path.source_address
                     || bound.source_name != path.source_name
+                    || bound.output_technology != path.output_technology
             })
         {
             return Err(DisplayError::new(
@@ -108,9 +131,10 @@ fn reject_foreign_restore_state(
         let expected_target = rebound_targets
             .iter()
             .find(|(id, _)| id.eq_ignore_ascii_case(&path.id));
-        let known_route = old
-            .or(baseline)
-            .is_some_and(|known| known.source_name == path.source_name);
+        let known_route = old.or(baseline).is_some_and(|known| {
+            known.source_name == path.source_name
+                && known.output_technology == path.output_technology
+        });
         !known_route
             || old.is_some_and(|known| known.target_address != path.target_address)
             || (old.is_none()
@@ -662,6 +686,7 @@ fn verify_activated_route(route: &RouteBinding, readback: &Snapshot) -> DisplayR
     if actual.source_name != route.source_name
         || actual.source_address != route.source_address
         || actual.target_address != route.target_address
+        || actual.output_technology != route.output_technology
     {
         return Err(DisplayError::new(
             "verification_failed",
@@ -739,6 +764,12 @@ mod tests {
                 HighPart: saved.target_address.adapter_high,
             };
             path.targetInfo.id = saved.target_address.id;
+            path.targetInfo.targetAvailable = 1;
+            path.targetInfo.outputTechnology = saved.output_technology;
+            path.targetInfo.refreshRate = conversion::native_rational(saved.refresh);
+            path.targetInfo.scanLineOrdering = saved.scan_line_ordering;
+            path.sourceInfo.statusFlags = saved.source_flags;
+            path.targetInfo.statusFlags = saved.target_flags;
             let source_key = (
                 saved.source_address.adapter_low,
                 saved.source_address.adapter_high,
@@ -835,6 +866,156 @@ mod tests {
         second.hdr_enabled = second_hdr;
         configuration.displays.push(second);
         configuration
+    }
+
+    fn wired_indirect_snapshot() -> Snapshot {
+        let mut display = readback_path("owned.monitor.interface", 0, Some(false));
+        display.output_technology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+        Snapshot {
+            format_version: 1,
+            paths: vec![display],
+        }
+    }
+
+    fn wired_indirect_names(_: &DISPLAYCONFIG_PATH_INFO) -> DisplayResult<query::DeviceNames> {
+        Ok(query::DeviceNames {
+            id: "owned.monitor.interface".into(),
+            source: "owned.monitor.interface".into(),
+            friendly: "Owned display".into(),
+        })
+    }
+
+    #[test]
+    fn wired_indirect_snapshot_restores_exact_identity_after_adapter_rebind() {
+        let saved = wired_indirect_snapshot();
+        let buffers = synthetic_bound(&saved);
+        let observed =
+            query::snapshot_from_buffers(&buffers, wired_indirect_names, |_| Ok(Some(false)))
+                .unwrap();
+        assert!(saved.equivalent(&observed));
+        assert_eq!(
+            observed.paths[0].output_technology,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED
+        );
+
+        let mut available = synthetic_bound(&saved);
+        available.paths[0].sourceInfo.adapterId.LowPart = 88;
+        available.paths[0].targetInfo.adapterId.LowPart = 88;
+        available.paths[0].sourceInfo.id = 7;
+        available.paths[0].targetInfo.id = 9;
+        let restored =
+            apply::restoration_from_available(&saved, &available, wired_indirect_names).unwrap();
+        assert_eq!(restored.paths[0].targetInfo.adapterId.LowPart, 88);
+        assert_eq!(restored.paths[0].targetInfo.id, 9);
+        assert_eq!(restored.paths[0].sourceInfo.id, 7);
+        let observed =
+            query::snapshot_from_buffers(&restored, wired_indirect_names, |_| Ok(Some(false)))
+                .unwrap();
+        assert!(saved.equivalent(&observed));
+        let rebound_targets = vec![(
+            saved.paths[0].id.clone(),
+            observed.paths[0].target_address.clone(),
+        )];
+        reject_foreign_restore_state(
+            &saved,
+            &Snapshot {
+                format_version: 1,
+                paths: vec![],
+            },
+            &rebound_targets,
+            &observed,
+        )
+        .unwrap();
+        verify_restoration_routes(&saved, &observed).unwrap();
+    }
+
+    #[test]
+    fn wired_indirect_restore_rejects_changed_technology_or_ambiguous_identity() {
+        let saved = wired_indirect_snapshot();
+        let mut available = synthetic_bound(&saved);
+        available.paths[0].targetInfo.outputTechnology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+        assert_eq!(
+            apply::restoration_from_available(&saved, &available, wired_indirect_names)
+                .err()
+                .unwrap()
+                .code,
+            "recovery_blocked"
+        );
+        available.paths[0].targetInfo.outputTechnology =
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED;
+        let mut other = available.paths[0];
+        other.targetInfo.id += 1;
+        available.paths.push(other);
+        assert_eq!(
+            apply::restoration_from_available(&saved, &available, wired_indirect_names)
+                .err()
+                .unwrap()
+                .code,
+            "unsupported_topology"
+        );
+    }
+
+    #[test]
+    fn wired_indirect_readback_rejects_changed_output_technology() {
+        let saved = wired_indirect_snapshot();
+        let mut current = saved.clone();
+        current.paths[0].output_technology = DISPLAYCONFIG_OUTPUT_TECHNOLOGY_HDMI;
+        let configuration = saved.configuration().unwrap();
+        assert_eq!(
+            reject_foreign_apply_state(&configuration, &saved, None, &current)
+                .unwrap_err()
+                .code,
+            "topology_changed"
+        );
+        let route = RouteBinding {
+            id: saved.paths[0].id.clone(),
+            source_name: saved.paths[0].source_name.clone(),
+            source_address: saved.paths[0].source_address.clone(),
+            target_address: saved.paths[0].target_address.clone(),
+            output_technology: DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED,
+        };
+        assert_eq!(
+            verify_activated_route(&route, &current).unwrap_err().code,
+            "verification_failed"
+        );
+    }
+
+    #[test]
+    fn wired_indirect_activation_retains_unambiguous_free_source_requirement() {
+        let saved = wired_indirect_snapshot();
+        let mut path = synthetic_bound(&saved).paths[0];
+        path.sourceInfo.id = 8;
+        path.targetInfo.id = 9;
+        let candidate = || vec![(path, wired_indirect_names(&path).unwrap())];
+        let (selected, names) =
+            apply::select_candidate_route(candidate(), &saved, "unsupported_topology").unwrap();
+        assert_eq!(selected.targetInfo.id, 9);
+        assert_eq!(names.id, saved.paths[0].id);
+        path.sourceInfo.id = saved.paths[0].source_address.id;
+        let in_use = vec![(path, wired_indirect_names(&path).unwrap())];
+        assert_eq!(
+            apply::select_candidate_route(in_use, &saved, "unsupported_topology")
+                .err()
+                .unwrap()
+                .code,
+            "unsupported_topology"
+        );
+        for technology in [
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST,
+            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL,
+        ] {
+            let mut unavailable = synthetic_bound(&saved);
+            unavailable.paths[0].targetInfo.outputTechnology = technology;
+            assert_eq!(
+                query::snapshot_from_buffers(&unavailable, wired_indirect_names, |_| Ok(Some(
+                    false
+                )))
+                .err()
+                .unwrap()
+                .code,
+                "unsupported_display"
+            );
+        }
     }
 
     #[test]

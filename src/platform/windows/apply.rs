@@ -125,17 +125,7 @@ pub fn requested(configuration: &Configuration) -> DisplayResult<ConfigurationBu
                     "display is missing or has no route for its requested clone group",
                 )
             })?;
-        if matches!(
-            path.targetInfo.outputTechnology,
-            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST
-        ) {
-            return Err(DisplayError::new(
-                "unsupported_display",
-                "indirect and wireless display mutation is unsupported",
-            ));
-        }
+        super::require_restorable_output(path.targetInfo.outputTechnology, "unsupported_display")?;
         let source_key = (
             path.sourceInfo.adapterId.LowPart,
             path.sourceInfo.adapterId.HighPart,
@@ -186,6 +176,15 @@ pub fn requested(configuration: &Configuration) -> DisplayResult<ConfigurationBu
 pub fn restoration(snapshot: &Snapshot) -> DisplayResult<ConfigurationBuffers> {
     snapshot.validate()?;
     let available = query(QDC_ALL_PATHS)?;
+    restoration_from_available(snapshot, &available, names)
+}
+
+pub(super) fn restoration_from_available(
+    snapshot: &Snapshot,
+    available: &ConfigurationBuffers,
+    mut resolve_names: impl FnMut(&DISPLAYCONFIG_PATH_INFO) -> DisplayResult<super::query::DeviceNames>,
+) -> DisplayResult<ConfigurationBuffers> {
+    snapshot.validate()?;
     let mut paths = Vec::new();
     let mut modes = Vec::new();
     let mut source_modes = BTreeMap::new();
@@ -195,7 +194,7 @@ pub fn restoration(snapshot: &Snapshot) -> DisplayResult<ConfigurationBuffers> {
             if candidate.targetInfo.targetAvailable == 0 {
                 continue;
             }
-            let device = names(candidate)?;
+            let device = resolve_names(candidate)?;
             // Monitor device-interface paths are durable identities. Adapter
             // LUIDs are session-local and must be rebound after an OS restart.
             if device.id == saved.id && device.source == saved.source_name {
@@ -402,17 +401,7 @@ fn select_clone_route(
         if !device.id.eq_ignore_ascii_case(display) {
             continue;
         }
-        if matches!(
-            path.targetInfo.outputTechnology,
-            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST
-        ) {
-            return Err(DisplayError::new(
-                code,
-                "indirect clone route is unsupported",
-            ));
-        }
+        super::require_restorable_output(path.targetInfo.outputTechnology, code)?;
         if let Some((previous, _)) = found.as_ref() {
             if address(previous.targetInfo.adapterId, previous.targetInfo.id)
                 != address(path.targetInfo.adapterId, path.targetInfo.id)
@@ -607,17 +596,7 @@ pub(super) fn select_candidate_route(
     for (path, device) in candidates {
         let target = address(path.targetInfo.adapterId, path.targetInfo.id);
         physical_targets.insert((target.adapter_low, target.adapter_high, target.id));
-        if matches!(
-            path.targetInfo.outputTechnology,
-            DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_VIRTUAL
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_INDIRECT_WIRED
-                | DISPLAYCONFIG_OUTPUT_TECHNOLOGY_MIRACAST
-        ) {
-            return Err(DisplayError::new(
-                ambiguous_code,
-                "inactive indirect or wireless route is unsupported",
-            ));
-        }
+        super::require_restorable_output(path.targetInfo.outputTechnology, ambiguous_code)?;
         let source = address(path.sourceInfo.adapterId, path.sourceInfo.id);
         if before
             .paths
