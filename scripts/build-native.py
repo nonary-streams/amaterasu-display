@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix="amaterasu-plugin-manifest-", dir=target
     workspace = Path(temporary)
     manifest = (repository / "Cargo.toml").read_text()
     manifest = manifest.replace("[lib]", "[workspace]\n\n[lib]\npath = " + json.dumps(str(repository / "src/lib.rs")))
-    for dependency in ["module-sdk", "configuration-schema", "windows-capture-geometry"]:
+    for dependency in ["module-sdk", "contracts", "configuration-schema", "windows-capture-geometry"]:
         manifest = re.sub(r'path = "[^"\n]*crates/' + dependency + r'"',
                           'path = ' + json.dumps(str(sdk_root / "crates" / dependency)), manifest)
     (workspace / "Cargo.toml").write_text(manifest)
