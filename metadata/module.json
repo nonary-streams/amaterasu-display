@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "family": "display",
+  "repository": "https://github.com/nonary-streams/amaterasu-display",
+  "mount": "modules/display",
+  "components": [
+    {
+      "id": "amaterasu.display",
+      "package": "amaterasu-display",
+      "path": ".",
+      "name": "Displays",
+      "summary": "Lists displays and applies the stream's display mode."
+    }
+  ]
+}
