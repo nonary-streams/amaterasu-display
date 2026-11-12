@@ -131,5 +131,6 @@ pub fn decode_path(
         target_flags: path.targetInfo.statusFlags,
         path_flags: path.flags,
         hdr_enabled: None,
+        color_profile: Default::default(),
     })
 }

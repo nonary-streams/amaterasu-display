@@ -56,6 +56,7 @@ fn snapshot() -> Snapshot {
             target_flags: 0,
             path_flags: 1,
             hdr_enabled: Some(false),
+            color_profile: Default::default(),
         }],
     }
 }
@@ -679,6 +680,8 @@ struct FakePlatform {
     kscreen_restore_failure: bool,
     kscreen_restore_readback_failure: bool,
     kscreen_restore_calls: usize,
+    profile_state: amaterasu_contracts::display_color_profile::ColorProfileState,
+    profile_effects: Vec<&'static str>,
 }
 impl Platform for FakePlatform {
     fn capture_targets(&mut self) -> DisplayResult<Vec<crate::targets::NativeTarget>> {
@@ -707,7 +710,118 @@ impl Platform for FakePlatform {
             .collect()
     }
     fn name(&self) -> &'static str {
-        "fake_platform_test_only"
+        "replacement_hdr_profile_provider_test_only"
+    }
+    fn resolve_hdr_profile(
+        &mut self,
+        request: &amaterasu_contracts::display_color_profile::HdrProfileResolutionRequest,
+    ) -> DisplayResult<amaterasu_contracts::display_color_profile::HdrProfileResolution> {
+        use amaterasu_contracts::display_color_profile::{
+            HdrProfileDescriptor, HdrProfileResolution,
+        };
+        request
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid request"))?;
+        let profile = HdrProfileDescriptor {
+            selection: request.selection.clone(),
+            revision: "replacement-provider-content-revision".into(),
+            peak_luminance_nits: Some(1200),
+        };
+        Ok(HdrProfileResolution {
+            requested_selection: request.selection.clone(),
+            lifecycle_target: request.lifecycle_target.clone(),
+            profile,
+            target_id: request.target_id.clone(),
+            target_revision: request.target_revision.clone(),
+            policy_revision: request.policy_revision.clone(),
+        })
+    }
+    fn inspect_hdr_profile_recovery(
+        &mut self,
+        receipt: &amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt,
+    ) -> DisplayResult<amaterasu_contracts::display_color_profile::HdrProfileRecoveryState> {
+        use amaterasu_contracts::display_color_profile::{
+            ColorProfileState, HdrProfileRecoveryState,
+        };
+        let applied = ColorProfileState::Selected(receipt.applied.clone());
+        if self.profile_state == applied {
+            Ok(HdrProfileRecoveryState::Applied)
+        } else if self.profile_state == receipt.previous {
+            Ok(HdrProfileRecoveryState::Restored)
+        } else {
+            Err(DisplayError::new(
+                "profile_state_uncertain",
+                "replacement provider has an unrelated state",
+            ))
+        }
+    }
+    fn prepare_hdr_profile(
+        &mut self,
+        resolution: &amaterasu_contracts::display_color_profile::HdrProfileResolution,
+        operation_id: &str,
+        owner: &str,
+    ) -> DisplayResult<amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt> {
+        use amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt;
+        resolution
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid resolution"))?;
+        Ok(HdrProfileApplyReceipt {
+            receipt_id: "replacement-receipt-1".into(),
+            operation_id: operation_id.into(),
+            owner: owner.into(),
+            lifecycle_target: resolution.lifecycle_target.clone(),
+            target_id: resolution.target_id.clone(),
+            target_binding_revision: "replacement-target-binding".into(),
+            policy_revision: resolution.policy_revision.clone(),
+            previous: self.profile_state.clone(),
+            applied: resolution.profile.clone(),
+        })
+    }
+    fn apply_hdr_profile(
+        &mut self,
+        receipt: &amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt,
+    ) -> DisplayResult<()> {
+        use amaterasu_contracts::display_color_profile::ColorProfileState;
+        receipt
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid receipt"))?;
+        let applied = ColorProfileState::Selected(receipt.applied.clone());
+        if self.profile_state == applied {
+            return Ok(());
+        }
+        if self.profile_state != receipt.previous {
+            return Err(DisplayError::new(
+                "profile_state_uncertain",
+                "state changed",
+            ));
+        }
+        self.profile_state = applied;
+        self.profile_effects.push("apply");
+        Ok(())
+    }
+    fn restore_hdr_profile(
+        &mut self,
+        receipt: &amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt,
+        owner: &str,
+    ) -> DisplayResult<()> {
+        use amaterasu_contracts::display_color_profile::ColorProfileState;
+        receipt
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid receipt"))?;
+        if receipt.owner != owner {
+            return Err(DisplayError::new("not_owner", "foreign owner"));
+        }
+        let applied = ColorProfileState::Selected(receipt.applied.clone());
+        if self.profile_state == applied {
+            self.profile_state = receipt.previous.clone();
+            self.profile_effects.push("restore");
+        } else if self.profile_state != receipt.previous {
+            return Err(DisplayError::new(
+                "profile_target_changed",
+                "foreign profile",
+            ));
+        }
+        Ok(())
     }
     fn supported(&self) -> bool {
         !self.scoped_only
@@ -1367,6 +1481,8 @@ struct State {
     lose_scoped_commit: bool,
     revision: u64,
     journal: Option<Value>,
+    profile_revision: u64,
+    profile_journal: Option<Value>,
     fail_save: bool,
     fail_clear: bool,
     cancel_ack: bool,
@@ -1381,10 +1497,24 @@ impl State {
         caller: &str,
         payload: Value,
     ) -> Value {
+        self.run_service(pipeline, caller, SERVICE, payload)
+    }
+    fn run_service(
+        &mut self,
+        pipeline: &mut Pipeline<FakePlatform>,
+        caller: &str,
+        request_service: &str,
+        payload: Value,
+    ) -> Value {
+        let request_action = payload["action"].as_str().unwrap_or_default().to_owned();
         let native_mutation = !matches!(
-            payload["action"].as_str(),
-            Some("borrow_target" | "release_target")
-        );
+            request_action.as_str(),
+            "borrow_target"
+                | "release_target"
+                | "resolve_hdr_profile"
+                | "prepare_hdr_profile"
+                | "restore_hdr_profile"
+        ) && request_action != "apply_hdr_profile";
         let mut input = Some(payload);
         let mut state_reply = None;
         let mut result = None;
@@ -1392,7 +1522,7 @@ impl State {
             pipeline.tick(|command| {
                 assert!(serde_json::to_vec(&command).unwrap().len() < 16_384);
                 Ok(match command {
-                    Command::Poll {} => input.take().map_or(Response::Pending, |payload| Response::Request { id:7, caller:caller.into(), initiator:"original.initiator".into(), service:SERVICE.into(), payload, remaining_ms:30_000 }),
+                    Command::Poll {} => input.take().map_or(Response::Pending, |payload| Response::Request { id:7, caller:caller.into(), initiator:"original.initiator".into(), service:request_service.into(), payload, remaining_ms:30_000 }),
                     Command::Request { service, payload, parent, .. } => {
                         assert_eq!(parent, Some(7));
                         if service == amaterasu_module_sdk::virtual_display::SERVICE {
@@ -1402,22 +1532,24 @@ impl State {
                             return Ok(Response::Accepted {id:20});
                         }
                         assert_eq!(service,STATE_SERVICE);
-                        assert_eq!(payload["key"], JOURNAL_KEY);
+                        let profile_key = payload["key"] == PROFILE_JOURNAL_KEY;
+                        assert!(profile_key || payload["key"] == JOURNAL_KEY);
+                        let (revision, journal) = if profile_key { (&mut self.profile_revision, &mut self.profile_journal) } else { (&mut self.revision, &mut self.journal) };
                         state_reply = Some(match payload["action"].as_str().unwrap() {
-                            "get" => json!({"ok":true,"revision":self.revision,"found":self.journal.is_some(),"value":self.journal}),
+                            "get" => json!({"ok":true,"revision":*revision,"found":journal.is_some(),"value":journal}),
                             "set" if self.fail_save => failure("storage_error", "injected failure before durable snapshot"),
                             "set" => {
-                                assert_eq!(payload["expected_revision"], self.revision);
-                                self.journal = Some(payload["value"].clone());
-                                self.revision += 1;
-                                json!({"ok":true,"revision":self.revision})
+                                assert_eq!(payload["expected_revision"], *revision);
+                                *journal = Some(payload["value"].clone());
+                                *revision += 1;
+                                json!({"ok":true,"revision":*revision})
                             }
                             "delete" if self.fail_clear => failure("storage_error", "injected journal clear failure"),
                             "delete" => {
-                                assert_eq!(payload["expected_revision"], self.revision);
-                                self.journal = None;
-                                self.revision += 1;
-                                json!({"ok":true,"revision":self.revision})
+                                assert_eq!(payload["expected_revision"], *revision);
+                                *journal = None;
+                                *revision += 1;
+                                json!({"ok":true,"revision":*revision})
                             }
                             action => panic!("unexpected state action {action}"),
                         });
@@ -1437,7 +1569,11 @@ impl State {
                     }
                     Command::CheckRequest { request } => {
                         assert_eq!(request, 7);
-                        assert!(!native_mutation || self.journal.is_some(), "native effect requires durable journal");
+                        if request_action == "apply_hdr_profile" {
+                            assert!(self.profile_journal.is_some(), "profile apply requires its durable receipt");
+                        } else {
+                            assert!(!native_mutation || self.journal.is_some(), "native effect requires durable journal");
+                        }
                         if self.deny_guard { Response::error("request_ended", "cancelled at native boundary") } else { Response::Ok }
                     }
                     Command::Complete { payload, .. } => {
@@ -4875,3 +5011,88 @@ fn physical_domain_tracks_durable_lease_revision_and_rejects_stale_plans() {
 
 mod scoped;
 mod targets;
+
+#[test]
+fn unchanged_pipeline_uses_replacement_profile_provider_and_durable_receipt_lifecycle() {
+    use amaterasu_contracts::display_color_profile::{
+        ColorProfileState, HdrProfileResolutionRequest, HdrProfileSelection,
+    };
+
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(
+        FakePlatform {
+            profile_state: ColorProfileState::SystemDefault,
+            ..Default::default()
+        },
+        false,
+    );
+    let request = HdrProfileResolutionRequest {
+        selection: HdrProfileSelection {
+            id: "replacement-profile.icc".into(),
+        },
+        lifecycle_target: Some(
+            amaterasu_module_sdk::extension_api::LifecycleTarget::Session {
+                host_epoch: "epoch-1".into(),
+                session_id: "session-1".into(),
+                generation: 7,
+            },
+        ),
+        target_id: "monitor.one".into(),
+        target_revision: "topology-revision".into(),
+        policy_revision: "policy-revision".into(),
+    };
+    let resolved = state.run_service(
+        &mut pipeline,
+        "nvhttp-client",
+        crate::PROFILE_SERVICE_V2,
+        json!({"action":"resolve_hdr_profile","request":request}),
+    );
+    assert_eq!(resolved["ok"], true);
+    let resolution = resolved["resolution"].clone();
+    let prepared = state.run_service(
+        &mut pipeline,
+        "nvhttp-client",
+        crate::PROFILE_SERVICE_V2,
+        json!({"action":"prepare_hdr_profile","operation_id":"stream-op-1","resolution":resolution}),
+    );
+    assert_eq!(prepared["ok"], true);
+    let receipt = prepared["receipt"].clone();
+    assert_eq!(state.profile_journal.as_ref().unwrap()["receipt"], receipt);
+    assert!(pipeline.platform.profile_effects.is_empty());
+
+    let applied = state.run_service(
+        &mut pipeline,
+        "nvhttp-client",
+        crate::PROFILE_SERVICE_V2,
+        json!({"action":"apply_hdr_profile","receipt":receipt}),
+    );
+    assert_eq!(applied["ok"], true);
+    assert_eq!(pipeline.platform.profile_effects, ["apply"]);
+    assert!(state.profile_journal.is_some());
+
+    let restored = state.run_service(
+        &mut pipeline,
+        "nvhttp-client",
+        crate::PROFILE_SERVICE_V2,
+        json!({"action":"restore_hdr_profile","receipt":receipt}),
+    );
+    assert_eq!(restored["ok"], true);
+    assert_eq!(pipeline.platform.profile_effects, ["apply", "restore"]);
+    assert_eq!(
+        pipeline.platform.profile_state,
+        ColorProfileState::SystemDefault
+    );
+    assert!(state.profile_journal.is_none());
+}
+
+#[test]
+fn legacy_snapshot_without_profile_state_roundtrips_without_changing_its_revision() {
+    let snapshot = snapshot();
+    let mut legacy = serde_json::to_value(&snapshot).unwrap();
+    for path in legacy["paths"].as_array_mut().unwrap() {
+        path.as_object_mut().unwrap().remove("color_profile");
+    }
+    let restored: Snapshot = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&restored).unwrap(), legacy);
+    assert_eq!(restored.revision().unwrap(), snapshot.revision().unwrap());
+}

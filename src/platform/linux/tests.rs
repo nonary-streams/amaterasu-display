@@ -1402,3 +1402,24 @@ fn current_physical_kscreen_inventory_has_recoverable_monitor_identities() {
         assert_eq!(output.hardware_identity, current.hardware_identity);
     }
 }
+
+#[test]
+fn hdr_profile_capability_is_typed_unsupported_without_mutation() {
+    use amaterasu_contracts::display_color_profile::{
+        HdrProfileResolutionRequest, HdrProfileSelection,
+    };
+
+    let mut platform = LinuxPlatform;
+    let request = HdrProfileResolutionRequest {
+        selection: HdrProfileSelection {
+            id: "display.icc".into(),
+        },
+        lifecycle_target: None,
+        target_id: "DP-1".into(),
+        target_revision: "topology-revision".into(),
+        policy_revision: "policy-revision".into(),
+    };
+    let error = platform.resolve_hdr_profile(&request).unwrap_err();
+    assert_eq!(error.code, "unsupported_hdr_profile");
+    assert!(platform.supported());
+}

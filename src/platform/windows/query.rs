@@ -359,7 +359,11 @@ fn unique_active_target<'a>(
 pub fn snapshot() -> DisplayResult<Snapshot> {
     let buffers = query(QDC_ONLY_ACTIVE_PATHS)?;
     check_virtual_layout(&buffers)?;
-    snapshot_from_buffers(&buffers, names, advanced_color_enabled)
+    let mut snapshot = snapshot_from_buffers(&buffers, names, advanced_color_enabled)?;
+    for path in &mut snapshot.paths {
+        path.color_profile = super::hdr_profile::observed_profile(path)?;
+    }
+    Ok(snapshot)
 }
 
 pub(super) fn snapshot_from_buffers(

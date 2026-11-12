@@ -2,6 +2,10 @@ use crate::model::{
     Address, AvailableMode, Configuration, DisplayError, DisplayResult, KScreenSnapshot,
     RouteBinding, Snapshot,
 };
+use amaterasu_contracts::display_color_profile::{
+    HdrProfileApplyReceipt, HdrProfileRecoveryState, HdrProfileResolution,
+    HdrProfileResolutionRequest,
+};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,6 +19,55 @@ pub enum TopologyShape {
 
 pub trait Platform {
     fn name(&self) -> &'static str;
+    /// Resolve an opaque profile catalog ID without changing display state.
+    fn resolve_hdr_profile(
+        &mut self,
+        _request: &HdrProfileResolutionRequest,
+    ) -> DisplayResult<HdrProfileResolution> {
+        Err(DisplayError::new(
+            "unsupported_hdr_profile",
+            "this display provider cannot resolve or apply HDR color profiles",
+        ))
+    }
+    /// Read the durable receipt's exact target state after a consumer restart.
+    /// This is read-only; the consumer decides whether the old operation has
+    /// retired before requesting receipt-backed restoration.
+    fn inspect_hdr_profile_recovery(
+        &mut self,
+        _receipt: &HdrProfileApplyReceipt,
+    ) -> DisplayResult<HdrProfileRecoveryState> {
+        Err(DisplayError::new(
+            "unsupported_hdr_profile",
+            "this display provider cannot inspect HDR profile recovery state",
+        ))
+    }
+    fn prepare_hdr_profile(
+        &mut self,
+        _resolution: &HdrProfileResolution,
+        _operation_id: &str,
+        _owner: &str,
+    ) -> DisplayResult<HdrProfileApplyReceipt> {
+        Err(DisplayError::new(
+            "unsupported_hdr_profile",
+            "this display provider cannot prepare HDR profile association",
+        ))
+    }
+    fn apply_hdr_profile(&mut self, _receipt: &HdrProfileApplyReceipt) -> DisplayResult<()> {
+        Err(DisplayError::new(
+            "unsupported_hdr_profile",
+            "this display provider cannot associate HDR profiles",
+        ))
+    }
+    fn restore_hdr_profile(
+        &mut self,
+        _receipt: &HdrProfileApplyReceipt,
+        _owner: &str,
+    ) -> DisplayResult<()> {
+        Err(DisplayError::new(
+            "unsupported_hdr_profile",
+            "this display provider cannot restore HDR profile associations",
+        ))
+    }
     fn supported(&self) -> bool;
     /// Read-only observations of independently resolved exact capture sources.
     /// Missing support is explicit; callers may not select an arbitrary output.

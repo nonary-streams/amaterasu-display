@@ -1,0 +1,47 @@
+[
+  {
+    "service": "nonary.display-profile/1",
+    "method": "resolve_hdr_profile",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {"request": "object"}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean", "resolution": "object"}, "optional": {}, "allow_extra": false},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display-profile/1",
+    "method": "prepare_hdr_profile",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {"operation_id": "string", "resolution": "object"}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean", "receipt": "object"}, "optional": {}, "allow_extra": false},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display-profile/1",
+    "method": "recover_hdr_profile",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean", "found": "boolean"}, "optional": {"receipt": "object", "state": "string"}, "allow_extra": false},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display-profile/1",
+    "method": "apply_hdr_profile",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {"receipt": "object"}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": false},
+    "privilege": "user"
+  },
+  {
+    "service": "nonary.display-profile/1",
+    "method": "restore_hdr_profile",
+    "interface_major": 1,
+    "interface_minor": 0,
+    "request": {"required": {"receipt": "object"}, "optional": {}, "allow_extra": false},
+    "response": {"required": {"ok": "boolean"}, "optional": {}, "allow_extra": false},
+    "privilege": "user"
+  }
+]

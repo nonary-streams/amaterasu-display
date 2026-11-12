@@ -1,6 +1,7 @@
 mod apply;
 mod conversion;
 mod hdr_control;
+mod hdr_profile;
 mod query;
 
 use super::Platform;
@@ -151,6 +152,278 @@ fn reject_foreign_restore_state(
 #[derive(Default)]
 pub struct WindowsPlatform;
 impl Platform for WindowsPlatform {
+    fn resolve_hdr_profile(
+        &mut self,
+        request: &amaterasu_contracts::display_color_profile::HdrProfileResolutionRequest,
+    ) -> DisplayResult<amaterasu_contracts::display_color_profile::HdrProfileResolution> {
+        request
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid HDR profile resolution request"))?;
+        let snapshot = query::snapshot()?;
+        if snapshot.revision()? != request.target_revision {
+            return Err(DisplayError::new(
+                "display_target_changed",
+                "display topology changed before profile resolution",
+            ));
+        }
+        if !snapshot
+            .paths
+            .iter()
+            .any(|path| path.id == request.target_id)
+        {
+            return Err(DisplayError::new(
+                "display_target_not_found",
+                "profile target is not an active display",
+            ));
+        }
+        Ok(
+            amaterasu_contracts::display_color_profile::HdrProfileResolution {
+                requested_selection: request.selection.clone(),
+                lifecycle_target: request.lifecycle_target.clone(),
+                profile: hdr_profile::resolve(&request.selection)?,
+                target_id: request.target_id.clone(),
+                target_revision: request.target_revision.clone(),
+                policy_revision: request.policy_revision.clone(),
+            },
+        )
+    }
+    fn inspect_hdr_profile_recovery(
+        &mut self,
+        receipt: &amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt,
+    ) -> DisplayResult<amaterasu_contracts::display_color_profile::HdrProfileRecoveryState> {
+        use amaterasu_contracts::display_color_profile::{
+            ColorProfileState, HdrProfileRecoveryState,
+        };
+        receipt
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid HDR profile recovery receipt"))?;
+        let snapshot = query::snapshot()?;
+        let target = snapshot
+            .paths
+            .iter()
+            .find(|path| path.id == receipt.target_id)
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "display_target_not_found",
+                    "profile target is no longer active",
+                )
+            })?;
+        if profile_target_binding_revision(target)? != receipt.target_binding_revision {
+            return Err(DisplayError::new(
+                "profile_target_changed",
+                "display route changed after profile preparation",
+            ));
+        }
+        let current = hdr_profile::observed_profile(target)?;
+        if current == ColorProfileState::Selected(receipt.applied.clone()) {
+            Ok(HdrProfileRecoveryState::Applied)
+        } else if current == receipt.previous {
+            Ok(HdrProfileRecoveryState::Restored)
+        } else {
+            Err(DisplayError::new(
+                "profile_state_uncertain",
+                "current target profile matches neither the applied nor previous receipt state",
+            ))
+        }
+    }
+    fn prepare_hdr_profile(
+        &mut self,
+        resolution: &amaterasu_contracts::display_color_profile::HdrProfileResolution,
+        operation_id: &str,
+        owner: &str,
+    ) -> DisplayResult<amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt> {
+        use amaterasu_contracts::display_color_profile::{
+            ColorProfileState, HdrProfileApplyReceipt,
+        };
+        resolution
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid HDR profile resolution"))?;
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || owner.is_empty()
+            || owner.len() > 128
+        {
+            return Err(DisplayError::new(
+                "invalid_request",
+                "invalid HDR profile owner or operation id",
+            ));
+        }
+        let snapshot = query::snapshot()?;
+        if snapshot.revision()? != resolution.target_revision {
+            return Err(DisplayError::new(
+                "display_target_changed",
+                "display topology changed after profile resolution",
+            ));
+        }
+        let target = snapshot
+            .paths
+            .iter()
+            .find(|path| path.id == resolution.target_id)
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "display_target_not_found",
+                    "profile target is no longer active",
+                )
+            })?;
+        let previous = target.color_profile.clone();
+        if matches!(
+            previous,
+            ColorProfileState::Unknown | ColorProfileState::Unspecified
+        ) {
+            return Err(DisplayError::new(
+                "profile_state_unknown",
+                "exact previous profile state is required before mutation",
+            ));
+        }
+        if hdr_profile::resolve(&resolution.profile.selection)? != resolution.profile {
+            return Err(DisplayError::new(
+                "hdr_profile_changed",
+                "profile revision changed after resolution",
+            ));
+        }
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|_| DisplayError::new("runtime_error", "could not create profile receipt"))?;
+        let receipt = HdrProfileApplyReceipt {
+            receipt_id: nonce.iter().map(|byte| format!("{byte:02x}")).collect(),
+            operation_id: operation_id.to_owned(),
+            owner: owner.to_owned(),
+            lifecycle_target: resolution.lifecycle_target.clone(),
+            target_id: resolution.target_id.clone(),
+            target_binding_revision: profile_target_binding_revision(target)?,
+            policy_revision: resolution.policy_revision.clone(),
+            previous,
+            applied: resolution.profile.clone(),
+        };
+        receipt
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid profile receipt"))?;
+        Ok(receipt)
+    }
+
+    fn apply_hdr_profile(
+        &mut self,
+        receipt: &amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt,
+    ) -> DisplayResult<()> {
+        use amaterasu_contracts::display_color_profile::ColorProfileState;
+        receipt
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid HDR profile apply receipt"))?;
+        let snapshot = query::snapshot()?;
+        let target = snapshot
+            .paths
+            .iter()
+            .find(|path| path.id == receipt.target_id)
+            .ok_or_else(|| {
+                DisplayError::new(
+                    "display_target_not_found",
+                    "profile target is no longer active",
+                )
+            })?;
+        if profile_target_binding_revision(target)? != receipt.target_binding_revision {
+            return Err(DisplayError::new(
+                "profile_target_changed",
+                "display route changed after profile preparation",
+            ));
+        }
+        let current = target.color_profile.clone();
+        if current == ColorProfileState::Selected(receipt.applied.clone()) {
+            return Ok(());
+        }
+        if current != receipt.previous {
+            return Err(DisplayError::after_mutation(
+                DisplayError::new(
+                    "profile_state_uncertain",
+                    "current profile does not match the prepared baseline",
+                )
+                .with_recovery_receipt(serde_json::json!(receipt)),
+            ));
+        }
+        if hdr_profile::resolve(&receipt.applied.selection)? != receipt.applied {
+            return Err(DisplayError::new(
+                "hdr_profile_changed",
+                "profile revision changed after preparation",
+            ));
+        }
+        if let Err(error) = hdr_profile::set_profile(
+            target,
+            &ColorProfileState::Selected(receipt.applied.clone()),
+        ) {
+            if error.code == "profile_rollback_failed" {
+                return Err(error.with_recovery_receipt(serde_json::json!(receipt)));
+            }
+            return Err(error);
+        }
+        let observed = hdr_profile::observed_profile(target).map_err(|error| {
+            error
+                .with_recovery_receipt(serde_json::json!(receipt))
+                .after_mutation()
+        })?;
+        if observed != ColorProfileState::Selected(receipt.applied.clone()) {
+            return Err(DisplayError::after_mutation(
+                DisplayError::new(
+                    "profile_readback_mismatch",
+                    "Windows did not report the applied profile for the selected target",
+                )
+                .with_recovery_receipt(serde_json::json!(receipt)),
+            ));
+        }
+        Ok(())
+    }
+
+    fn restore_hdr_profile(
+        &mut self,
+        receipt: &amaterasu_contracts::display_color_profile::HdrProfileApplyReceipt,
+        owner: &str,
+    ) -> DisplayResult<()> {
+        use amaterasu_contracts::display_color_profile::ColorProfileState;
+        receipt
+            .validate()
+            .map_err(|code| DisplayError::new(code, "invalid HDR profile restore receipt"))?;
+        if receipt.owner != owner {
+            return Err(DisplayError::new(
+                "not_owner",
+                "HDR profile receipt belongs to another caller",
+            ));
+        }
+        let snapshot = query::snapshot()?;
+        let target = snapshot
+            .paths
+            .iter()
+            .find(|path| path.id == receipt.target_id)
+            .ok_or_else(|| {
+                DisplayError::after_mutation(DisplayError::new(
+                    "display_target_not_found",
+                    "profile target disappeared before restore",
+                ))
+            })?;
+        if profile_target_binding_revision(target)? != receipt.target_binding_revision {
+            return Err(DisplayError::new(
+                "profile_target_changed",
+                "display route changed after this operation",
+            ));
+        }
+        let current = hdr_profile::observed_profile(target)?;
+        if current != receipt.previous {
+            if current != ColorProfileState::Selected(receipt.applied.clone())
+                && !matches!(current, ColorProfileState::Unknown)
+            {
+                return Err(DisplayError::new(
+                    "profile_target_changed",
+                    "profile target changed after this operation",
+                ));
+            }
+            hdr_profile::force_restore(target, &receipt.previous)
+                .map_err(DisplayError::after_mutation)?;
+        }
+        if hdr_profile::observed_profile(target)? != receipt.previous {
+            return Err(DisplayError::after_mutation(DisplayError::new(
+                "profile_restore_mismatch",
+                "Windows did not report the exact previous profile after restore",
+            )));
+        }
+        Ok(())
+    }
     fn capture_targets(&mut self) -> DisplayResult<Vec<crate::targets::NativeTarget>> {
         let before = query::snapshot()?;
         let labels = query::monitors()?;
@@ -334,12 +607,12 @@ impl Platform for WindowsPlatform {
             |current| verify_restoration_routes(snapshot, current),
         )?;
         for path in &snapshot.paths {
+            let current = rebound
+                .paths
+                .iter()
+                .find(|candidate| candidate.id.eq_ignore_ascii_case(&path.id))
+                .expect("verified restoration contains each saved target");
             if let Some(enabled) = path.hdr_enabled {
-                let current = rebound
-                    .paths
-                    .iter()
-                    .find(|candidate| candidate.id.eq_ignore_ascii_case(&path.id))
-                    .expect("verified restoration contains each saved target");
                 query::set_advanced_color(current, enabled)
                     .map_err(DisplayError::after_mutation)?;
             }
@@ -359,6 +632,25 @@ impl Platform for WindowsPlatform {
         )?;
         Ok(())
     }
+}
+
+fn profile_target_binding_revision(path: &crate::model::DisplayPath) -> DisplayResult<String> {
+    let identity = serde_json::to_vec(&json!({
+        "id":path.id,
+        "source_name":path.source_name,
+        "source_address":path.source_address,
+        "target_address":path.target_address,
+    }))
+    .map_err(|_| {
+        DisplayError::new(
+            "profile_target_unavailable",
+            "display identity could not be serialized",
+        )
+    })?;
+    Ok(<sha2::Sha256 as sha2::Digest>::digest(&identity)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn prepare_configuration(
@@ -519,7 +811,7 @@ fn apply_configuration(
     if let Some(route) = route {
         query::verify_newly_active_hdr_is_off(route).map_err(DisplayError::after_mutation)?;
     }
-    settle(
+    let applied = settle(
         |current| reject_foreign_apply_state(configuration, before, route, current),
         |current| {
             verify_applied_configuration(configuration, Ok(current.clone()))?;
@@ -547,6 +839,7 @@ fn apply_configuration(
             Ok(())
         },
     )?;
+    let _ = applied;
     Ok(())
 }
 
@@ -855,6 +1148,7 @@ mod tests {
             target_flags: 0,
             path_flags: 1,
             hdr_enabled,
+            color_profile: Default::default(),
         }
     }
 
@@ -1768,6 +2062,7 @@ mod tests {
                 y: 0,
                 rotation: Rotation::Identity,
                 hdr_enabled: Some(true),
+                color_profile: Default::default(),
             }],
         }
     }

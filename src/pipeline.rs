@@ -9,7 +9,8 @@ use crate::model::{
     RouteBinding, Snapshot,
 };
 use crate::platform::{Platform, TopologyShape};
-use crate::{JOURNAL_KEY, STATE_SERVICE};
+use crate::{JOURNAL_KEY, PROFILE_JOURNAL_KEY, STATE_SERVICE};
+use amaterasu_contracts::display_color_profile::{HdrProfileApplyReceipt, HdrProfileResolution};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
@@ -72,6 +73,21 @@ enum Stage {
         native_target: Option<(String, TopologyShape)>,
     },
     Clearing(Value),
+    ProfileCheck {
+        receipt: HdrProfileApplyReceipt,
+    },
+    ProfilePrepared {
+        receipt: HdrProfileApplyReceipt,
+    },
+    ProfileApplyLoading {
+        receipt: HdrProfileApplyReceipt,
+    },
+    ProfileRecoverLoading,
+    ProfileRestoreLoading {
+        receipt: HdrProfileApplyReceipt,
+    },
+    ProfileRestoreCleared,
+    ProfileRecoveryCleared,
 }
 pub struct Pipeline<P> {
     platform: P,
@@ -139,6 +155,16 @@ impl<P: Platform> Pipeline<P> {
                         return complete(send, id, failure("invalid_request", error.to_string()));
                     }
                 };
+                if !operation_is_allowed_on_service(&service, &operation) {
+                    return complete(
+                        send,
+                        id,
+                        failure(
+                            "invalid_request",
+                            "HDR profile v1 and v2 operations require their separately selected display-profile service; v2 also requires a durable session owner binding",
+                        ),
+                    );
+                }
                 self.queued.push_back(Incoming {
                     context: Context {
                         request: id,
@@ -159,6 +185,91 @@ impl<P: Platform> Pipeline<P> {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if let Operation::ResolveHdrProfile { request } = &incoming.operation {
+            let result = request
+                .validate()
+                .map_err(|code| DisplayError::new(code, "invalid HDR profile resolution request"))
+                .and_then(|()| self.platform.resolve_hdr_profile(request))
+                .and_then(|resolution| {
+                    resolution
+                        .validate()
+                        .map_err(|code| DisplayError::new(code, "invalid HDR profile resolution"))?;
+                    if !resolution.matches(request) {
+                        return Err(DisplayError::new(
+                            "profile_resolution_mismatch",
+                            "display provider resolved a different profile, target, or policy revision",
+                        ));
+                    }
+                    Ok(json!({"ok":true,"resolution":resolution}))
+                });
+            return complete(
+                send,
+                incoming.context.request,
+                result.unwrap_or_else(DisplayError::payload),
+            );
+        }
+        if let Operation::PrepareHdrProfile {
+            operation_id,
+            resolution,
+        } = &incoming.operation
+        {
+            let receipt = match self.platform.prepare_hdr_profile(
+                resolution,
+                operation_id,
+                &incoming.context.caller,
+            ) {
+                Ok(receipt) => receipt,
+                Err(error) => return complete(send, incoming.context.request, error.payload()),
+            };
+            if let Err(error) = validate_profile_receipt(
+                &receipt,
+                &incoming.context.caller,
+                operation_id,
+                resolution,
+            ) {
+                return complete(send, incoming.context.request, error.payload());
+            }
+            return self.submit(
+                incoming.context,
+                json!({"action":"get","key":PROFILE_JOURNAL_KEY}),
+                Stage::ProfileCheck { receipt },
+                send,
+            );
+        }
+        if let Operation::ApplyHdrProfile { receipt } = &incoming.operation {
+            if let Err(error) = validate_profile_receipt_owner(receipt, &incoming.context.caller) {
+                return complete(send, incoming.context.request, error.payload());
+            }
+            return self.submit(
+                incoming.context,
+                json!({"action":"get","key":PROFILE_JOURNAL_KEY}),
+                Stage::ProfileApplyLoading {
+                    receipt: receipt.clone(),
+                },
+                send,
+            );
+        }
+        if matches!(incoming.operation, Operation::RecoverHdrProfile {}) {
+            return self.submit(
+                incoming.context,
+                json!({"action":"get","key":PROFILE_JOURNAL_KEY}),
+                Stage::ProfileRecoverLoading,
+                send,
+            );
+        }
+        if let Operation::RestoreHdrProfile { receipt } = &incoming.operation {
+            if let Err(error) = validate_profile_receipt_owner(receipt, &incoming.context.caller) {
+                return complete(send, incoming.context.request, error.payload());
+            }
+            return self.submit(
+                incoming.context,
+                json!({"action":"get","key":PROFILE_JOURNAL_KEY}),
+                Stage::ProfileRestoreLoading {
+                    receipt: receipt.clone(),
+                },
+                send,
+            );
+        }
         if matches!(
             incoming.operation,
             Operation::CaptureTargets {} | Operation::ResolveCaptureTarget { .. }
@@ -342,6 +453,185 @@ impl<P: Platform> Pipeline<P> {
                 if matches!(&pending.stage, Stage::ValidatingScoped(_)) {
                     return self.scoped_owner_validated(pending, payload, send);
                 }
+                match &pending.stage {
+                    Stage::ProfileCheck { receipt } => {
+                        if payload["ok"] != true {
+                            return complete(send, pending.context.request, payload);
+                        }
+                        let Some(revision) = payload["revision"].as_u64() else {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure("invalid_state_response", "missing state revision"),
+                            );
+                        };
+                        if payload["found"] != false {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure(
+                                    "profile_recovery_pending",
+                                    "another HDR profile operation has an unresolved recovery receipt",
+                                ),
+                            );
+                        }
+                        if let Err(error) = check_request(send, &pending.context) {
+                            return complete(send, pending.context.request, error.payload());
+                        }
+                        let journal = json!({"version":1,"receipt":receipt});
+                        return self.submit(
+                            pending.context,
+                            json!({"action":"set","key":PROFILE_JOURNAL_KEY,"expected_revision":revision,"value":journal}),
+                            Stage::ProfilePrepared { receipt: receipt.clone() },
+                            send,
+                        );
+                    }
+                    Stage::ProfileApplyLoading { receipt } => {
+                        if payload["ok"] != true {
+                            return complete(send, pending.context.request, payload);
+                        }
+                        let Some(_revision) = payload["revision"].as_u64() else {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure("invalid_state_response", "missing state revision"),
+                            );
+                        };
+                        if !profile_journal_matches(&payload, receipt) {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure(
+                                    "profile_receipt_mismatch",
+                                    "durable profile recovery receipt does not match this operation",
+                                ),
+                            );
+                        }
+                        if let Err(error) = check_request(send, &pending.context) {
+                            return complete(send, pending.context.request, error.payload());
+                        }
+                        let result = self.platform.apply_hdr_profile(receipt);
+                        return complete(
+                            send,
+                            pending.context.request,
+                            result
+                                .map(|()| json!({"ok":true}))
+                                .unwrap_or_else(DisplayError::payload),
+                        );
+                    }
+                    Stage::ProfileRecoverLoading => {
+                        if payload["ok"] != true {
+                            return complete(send, pending.context.request, payload);
+                        }
+                        let Some(revision) = payload["revision"].as_u64() else {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure("invalid_state_response", "missing state revision"),
+                            );
+                        };
+                        if payload["found"] == false {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                json!({"ok":true,"found":false}),
+                            );
+                        }
+                        if payload["value"]["version"] != 1 {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure(
+                                    "invalid_journal",
+                                    "profile recovery journal version is unsupported",
+                                ),
+                            );
+                        }
+                        let receipt = match serde_json::from_value::<HdrProfileApplyReceipt>(
+                            payload["value"]["receipt"].clone(),
+                        ) {
+                            Ok(receipt) => receipt,
+                            Err(_) => {
+                                return complete(
+                                    send,
+                                    pending.context.request,
+                                    failure(
+                                        "invalid_journal",
+                                        "profile recovery receipt is malformed",
+                                    ),
+                                );
+                            }
+                        };
+                        if let Err(error) =
+                            validate_profile_receipt_owner(&receipt, &pending.context.caller)
+                        {
+                            return complete(send, pending.context.request, error.payload());
+                        }
+                        if let Err(error) = check_request(send, &pending.context) {
+                            return complete(send, pending.context.request, error.payload());
+                        }
+                        match self.platform.inspect_hdr_profile_recovery(&receipt) {
+                            Ok(amaterasu_contracts::display_color_profile::HdrProfileRecoveryState::Applied) => {
+                                return complete(send, pending.context.request, json!({"ok":true,"found":true,"state":"applied","receipt":receipt}));
+                            }
+                            Ok(amaterasu_contracts::display_color_profile::HdrProfileRecoveryState::Restored) => {
+                                return self.submit(
+                                    pending.context,
+                                    json!({"action":"delete","key":PROFILE_JOURNAL_KEY,"expected_revision":revision}),
+                                    Stage::ProfileRecoveryCleared,
+                                    send,
+                                );
+                            }
+                            Err(error) => {
+                                let mut payload = error.payload();
+                                payload["recovery_required"] = true.into();
+                                payload["receipt"] = json!(receipt);
+                                return complete(send, pending.context.request, payload);
+                            }
+                        }
+                    }
+                    Stage::ProfileRestoreLoading { receipt } => {
+                        if payload["ok"] != true {
+                            return complete(send, pending.context.request, payload);
+                        }
+                        let Some(revision) = payload["revision"].as_u64() else {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure("invalid_state_response", "missing state revision"),
+                            );
+                        };
+                        if payload["found"] == false {
+                            return complete(send, pending.context.request, json!({"ok":true}));
+                        }
+                        if !profile_journal_matches(&payload, receipt) {
+                            return complete(
+                                send,
+                                pending.context.request,
+                                failure(
+                                    "profile_receipt_mismatch",
+                                    "durable profile recovery receipt does not match this operation",
+                                ),
+                            );
+                        }
+                        if let Err(error) = check_request(send, &pending.context) {
+                            return complete(send, pending.context.request, error.payload());
+                        }
+                        if let Err(error) = self
+                            .platform
+                            .restore_hdr_profile(receipt, &pending.context.caller)
+                        {
+                            return complete(send, pending.context.request, error.payload());
+                        }
+                        return self.submit(
+                            pending.context,
+                            json!({"action":"delete","key":PROFILE_JOURNAL_KEY,"expected_revision":revision}),
+                            Stage::ProfileRestoreCleared,
+                            send,
+                        );
+                    }
+                    _ => {}
+                }
                 if payload["ok"] != true {
                     return complete(
                         send,
@@ -410,6 +700,25 @@ impl<P: Platform> Pipeline<P> {
                     Stage::Clearing(reply) => {
                         self.active_lease = None;
                         complete(send, pending.context.request, reply)
+                    }
+                    Stage::ProfilePrepared { receipt } => complete(
+                        send,
+                        pending.context.request,
+                        json!({"ok":true,"receipt":receipt}),
+                    ),
+                    Stage::ProfileRestoreCleared => {
+                        complete(send, pending.context.request, json!({"ok":true}))
+                    }
+                    Stage::ProfileRecoveryCleared => complete(
+                        send,
+                        pending.context.request,
+                        json!({"ok":true,"found":false}),
+                    ),
+                    Stage::ProfileCheck { .. }
+                    | Stage::ProfileApplyLoading { .. }
+                    | Stage::ProfileRecoverLoading
+                    | Stage::ProfileRestoreLoading { .. } => {
+                        unreachable!("profile state stages handled before generic state reply")
                     }
                 }
             }
@@ -1903,6 +2212,80 @@ fn recovery_failure(error: DisplayError, lease: &str) -> Value {
     payload["lease"] = lease.into();
     payload
 }
+fn validate_profile_receipt_owner(
+    receipt: &HdrProfileApplyReceipt,
+    caller: &str,
+) -> DisplayResult<()> {
+    receipt
+        .validate()
+        .map_err(|code| DisplayError::new(code, "invalid HDR profile receipt"))?;
+    if receipt.owner != caller {
+        return Err(DisplayError::new(
+            "not_owner",
+            "HDR profile receipt belongs to another caller",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_receipt(
+    receipt: &HdrProfileApplyReceipt,
+    caller: &str,
+    operation_id: &str,
+    resolution: &HdrProfileResolution,
+) -> DisplayResult<()> {
+    validate_profile_receipt_owner(receipt, caller)?;
+    if receipt.operation_id != operation_id
+        || receipt.target_id != resolution.target_id
+        || receipt.policy_revision != resolution.policy_revision
+        || receipt.applied != resolution.profile
+    {
+        return Err(DisplayError::new(
+            "profile_receipt_mismatch",
+            "provider returned a receipt for a different profile operation",
+        ));
+    }
+    Ok(())
+}
+
+fn profile_journal_matches(payload: &Value, receipt: &HdrProfileApplyReceipt) -> bool {
+    payload["found"] == true
+        && payload["value"]["version"] == 1
+        && serde_json::from_value::<HdrProfileApplyReceipt>(payload["value"]["receipt"].clone())
+            .is_ok_and(|stored| stored == *receipt)
+}
+
+fn operation_has_lifecycle_owner(operation: &Operation) -> bool {
+    match operation {
+        Operation::ResolveHdrProfile { request } => request.lifecycle_target.is_some(),
+        Operation::PrepareHdrProfile { resolution, .. } => resolution.lifecycle_target.is_some(),
+        Operation::ApplyHdrProfile { receipt } | Operation::RestoreHdrProfile { receipt } => {
+            receipt.lifecycle_target.is_some()
+        }
+        Operation::RecoverHdrProfile {} => true,
+        _ => false,
+    }
+}
+
+fn operation_is_allowed_on_service(service: &str, operation: &Operation) -> bool {
+    let profile_operation = matches!(
+        operation,
+        Operation::ResolveHdrProfile { .. }
+            | Operation::PrepareHdrProfile { .. }
+            | Operation::RecoverHdrProfile {}
+            | Operation::ApplyHdrProfile { .. }
+            | Operation::RestoreHdrProfile { .. }
+    );
+    let lifecycle_owner = profile_operation && operation_has_lifecycle_owner(operation);
+    match service {
+        crate::PROFILE_SERVICE | crate::api::PROFILE_SERVICE => {
+            profile_operation && !lifecycle_owner
+        }
+        crate::PROFILE_SERVICE_V2 | crate::api::PROFILE_SERVICE_V2 => lifecycle_owner,
+        _ => !profile_operation,
+    }
+}
+
 fn failure(code: &'static str, message: impl Into<String>) -> Value {
     DisplayError::new(code, message).payload()
 }
@@ -1928,5 +2311,45 @@ fn complete(
         response => Err(format!("display completion failed: {response:?}")),
     }
 }
+#[cfg(test)]
+mod profile_service_tests {
+    use super::*;
+    use amaterasu_contracts::display_color_profile::HdrProfileSelection;
+
+    #[test]
+    fn profile_operation_requires_its_selected_versioned_service() {
+        let operation = Operation::ResolveHdrProfile {
+            request: amaterasu_contracts::display_color_profile::HdrProfileResolutionRequest {
+                selection: HdrProfileSelection {
+                    id: "display.icc".into(),
+                },
+                lifecycle_target: Some(
+                    amaterasu_module_sdk::extension_api::LifecycleTarget::Session {
+                        host_epoch: "epoch-1".into(),
+                        session_id: "session-1".into(),
+                        generation: 7,
+                    },
+                ),
+                target_id: "target".into(),
+                target_revision: "topology".into(),
+                policy_revision: "policy".into(),
+            },
+        };
+        assert!(operation_is_allowed_on_service(
+            crate::PROFILE_SERVICE_V2,
+            &operation
+        ));
+        assert!(operation_is_allowed_on_service(
+            crate::api::PROFILE_SERVICE_V2,
+            &operation
+        ));
+        assert!(!operation_is_allowed_on_service(
+            crate::PROFILE_SERVICE,
+            &operation
+        ));
+        assert!(!operation_is_allowed_on_service(crate::SERVICE, &operation));
+    }
+}
+
 #[cfg(test)]
 mod tests;

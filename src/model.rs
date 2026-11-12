@@ -3,6 +3,9 @@ use crate::hdr_option::{DisplayHdrOption, resolve_hdr_configuration};
 use crate::mode_remapping::{DisplayMode, ModeRemapping, Resolution, ResolverContext};
 use crate::refresh_rate_option::{RefreshRateOption, parse_manual_refresh_rate};
 use crate::resolution_option::{ManualResolution, ResolutionOption, select_additional_resolution};
+use amaterasu_contracts::display_color_profile::{
+    ColorProfileState, HdrProfileApplyReceipt, HdrProfileResolution, HdrProfileResolutionRequest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +17,20 @@ pub const MAX_DISPLAYS: usize = 16;
 // the serialized operation and durable request identity straightforward.
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
+    ResolveHdrProfile {
+        request: HdrProfileResolutionRequest,
+    },
+    RecoverHdrProfile {},
+    PrepareHdrProfile {
+        operation_id: String,
+        resolution: HdrProfileResolution,
+    },
+    ApplyHdrProfile {
+        receipt: HdrProfileApplyReceipt,
+    },
+    RestoreHdrProfile {
+        receipt: HdrProfileApplyReceipt,
+    },
     CaptureTargets {},
     ResolveCaptureTarget {
         selector: String,
@@ -146,6 +163,7 @@ pub struct DisplaySetting {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr_enabled: Option<bool>,
 }
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Rotation {
@@ -527,6 +545,9 @@ pub struct DisplayPath {
     /// None denotes a target without a queryable HDR state (including old journals).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdr_enabled: Option<bool>,
+    /// Exact observed color profile for recovery; unknown state fences mutation.
+    #[serde(default, skip_serializing_if = "ColorProfileState::is_unspecified")]
+    pub color_profile: ColorProfileState,
 }
 
 /// Versioned KScreen session state retained beside the CCD snapshot in a
@@ -1414,6 +1435,7 @@ pub struct DisplayError {
     pub may_have_changed: bool,
     pub code: &'static str,
     pub message: String,
+    pub recovery_receipt: Option<Value>,
 }
 impl DisplayError {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
@@ -1421,14 +1443,25 @@ impl DisplayError {
             may_have_changed: false,
             code,
             message: message.into(),
+            recovery_receipt: None,
         }
     }
     pub fn after_mutation(mut self) -> Self {
         self.may_have_changed = true;
         self
     }
+    #[cfg(windows)]
+    pub fn with_recovery_receipt(mut self, receipt: Value) -> Self {
+        self.recovery_receipt = Some(receipt);
+        self
+    }
     pub fn payload(self) -> Value {
-        json!({"ok":false,"error":{"code":self.code,"message":self.message.chars().take(512).collect::<String>()}})
+        let mut payload = json!({"ok":false,"error":{"code":self.code,"message":self.message.chars().take(512).collect::<String>()}});
+        if let Some(receipt) = self.recovery_receipt {
+            payload["recovery_required"] = true.into();
+            payload["receipt"] = receipt;
+        }
+        payload
     }
 }
 pub type DisplayResult<T> = Result<T, DisplayError>;
