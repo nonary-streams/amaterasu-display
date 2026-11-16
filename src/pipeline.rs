@@ -2,6 +2,7 @@
 use crate::SERVICE;
 mod kscreen;
 mod scoped;
+mod stream_issues;
 mod targets;
 use crate::configuration_option::DisplayConfigurationOption;
 use crate::model::{
@@ -97,6 +98,7 @@ pub struct Pipeline<P> {
     active_lease: Option<String>,
     mutation_domain_id: Option<String>,
     sequence: u64,
+    stream_issues: stream_issues::StreamIssues,
 }
 impl<P: Platform> Pipeline<P> {
     pub fn new(platform: P, allow_mutation: bool) -> Self {
@@ -118,19 +120,35 @@ impl<P: Platform> Pipeline<P> {
             active_lease: None,
             mutation_domain_id,
             sequence: 0,
+            stream_issues: Default::default(),
         }
     }
+    /// Report failed stream requests to the launch owner. Off by default so a
+    /// pipeline under test sends only the commands its test scripts.
+    pub fn enable_stream_issue_reports(&mut self) {
+        self.stream_issues.enable();
+    }
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
+        let mut completions = Vec::new();
+        let result = self.serve(&mut |command| {
+            completions.extend(stream_issues::Completion::observe(&command));
+            send(command)
+        });
+        self.stream_issues.settle(completions);
+        self.stream_issues.publish(&mut send);
+        result
+    }
+    fn serve(&mut self, send: &mut impl FnMut(Command) -> Transport) -> ModuleResult<()> {
         if let Some(pending) = self.pending.take() {
-            self.advance(pending, &mut send)?;
+            self.advance(pending, send)?;
         }
         if self.queued.len() < MAX_QUEUED {
-            self.receive(&mut send)?;
+            self.receive(send)?;
         }
         if self.pending.is_none()
             && let Some(incoming) = self.queued.pop_front()
         {
-            self.start(incoming, &mut send)?;
+            self.start(incoming, send)?;
         }
         Ok(())
     }
@@ -165,6 +183,7 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
+                self.stream_issues.track(id, &operation);
                 self.queued.push_back(Incoming {
                     context: Context {
                         request: id,
@@ -1345,6 +1364,8 @@ impl<P: Platform> Pipeline<P> {
                         ),
                     );
                 }
+                self.stream_issues
+                    .adopt(context.request, journal.operation_id.as_deref());
                 if journal.scoped_pending.is_some() {
                     return complete(
                         send,

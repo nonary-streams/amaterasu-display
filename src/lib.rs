@@ -112,16 +112,15 @@ impl ManagedModule for DisplayModule {
             })
             .collect();
         amaterasu_module_sdk::operation_api::register_selected(&runtime, &selected_methods)?;
-        Ok(Self {
-            runtime,
-            pipeline: Pipeline::new(
-                #[cfg(windows)]
-                NativePlatform::default(),
-                #[cfg(not(windows))]
-                NativePlatform,
-                settings.allow_mutation,
-            ),
-        })
+        let mut pipeline = Pipeline::new(
+            #[cfg(windows)]
+            NativePlatform::default(),
+            #[cfg(not(windows))]
+            NativePlatform,
+            settings.allow_mutation,
+        );
+        pipeline.enable_stream_issue_reports();
+        Ok(Self { runtime, pipeline })
     }
     fn tick(&mut self) -> ModuleResult<()> {
         self.pipeline

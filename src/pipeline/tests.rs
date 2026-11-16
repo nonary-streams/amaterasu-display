@@ -5010,6 +5010,7 @@ fn physical_domain_tracks_durable_lease_revision_and_rejects_stale_plans() {
 }
 
 mod scoped;
+mod stream_issues;
 mod targets;
 
 #[test]
