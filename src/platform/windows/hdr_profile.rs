@@ -256,9 +256,9 @@ fn read_profile(path: &Path) -> DisplayResult<Vec<u8>> {
     })?;
     crate::profile_reader::read_bounded_profile(file, MAX_PROFILE_BYTES, 132).map_err(|error| {
         match error {
-            crate::profile_reader::ProfileReadError::Io(_) => DisplayError::new(
+            crate::profile_reader::ProfileReadError::Io(error) => DisplayError::new(
                 "hdr_profile_not_found",
-                "selected color profile cannot be read",
+                format!("selected color profile cannot be read ({})", error.kind()),
             ),
             crate::profile_reader::ProfileReadError::TooLarge
             | crate::profile_reader::ProfileReadError::TooSmall => DisplayError::new(
