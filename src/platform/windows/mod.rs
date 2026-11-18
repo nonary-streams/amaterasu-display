@@ -2062,7 +2062,6 @@ mod tests {
                 y: 0,
                 rotation: Rotation::Identity,
                 hdr_enabled: Some(true),
-                color_profile: Default::default(),
             }],
         }
     }
