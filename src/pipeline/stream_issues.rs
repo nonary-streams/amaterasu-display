@@ -89,10 +89,6 @@ impl StreamIssues {
             };
             if let (Some(code), Some(operation)) = (completion.failure, tracked.operation) {
                 let issue = display_issue(operation, tracked.phase, &code);
-                eprintln!(
-                    "display stream issue operation={} phase={} code={code}",
-                    issue.operation, issue.phase
-                );
                 self.outbox.push(issue);
             }
         }
