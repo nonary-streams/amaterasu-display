@@ -72,7 +72,10 @@ fn a_failed_stream_apply_is_published_under_the_callers_operation() {
     );
     assert!(issue.caused_by.is_none());
     assert!(
-        issue.site.contains("pipeline/stream_issues.rs:"),
+        issue
+            .site
+            .replace('\\', "/")
+            .contains("pipeline/stream_issues.rs:"),
         "{}",
         issue.site
     );

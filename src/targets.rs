@@ -1,7 +1,10 @@
 //! Private native target observations and the public, opaque selection boundary.
 use crate::model::{DisplayError, DisplayResult, DisplaySetting};
+#[cfg(any(target_os = "linux", windows, test))]
 use amaterasu_module_sdk::capture::exact_target_selector;
-use amaterasu_module_sdk::display::targets::{Binding, Descriptor, MAX_TARGETS, Mode};
+#[cfg(any(target_os = "linux", windows, test))]
+use amaterasu_module_sdk::display::targets::Mode;
+use amaterasu_module_sdk::display::targets::{Binding, Descriptor, MAX_TARGETS};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -24,6 +27,7 @@ impl NativeTarget {
     }
     /// Inputs have already been matched to one exact native output by the
     /// platform provider. No native identity is serialized by these helpers.
+    #[cfg(any(target_os = "linux", windows, test))]
     pub fn observed(
         platform: &str,
         setting: DisplaySetting,
@@ -100,7 +104,8 @@ impl NativeTarget {
     }
 }
 
-pub fn selector_for(platform: &str, native_id: &str) -> DisplayResult<String> {
+#[cfg(any(target_os = "linux", windows, test))]
+fn selector_for(platform: &str, native_id: &str) -> DisplayResult<String> {
     let identity = format!(
         "amaterasu.display.target/1:{platform}:{}",
         if platform == "windows_ccd" {
