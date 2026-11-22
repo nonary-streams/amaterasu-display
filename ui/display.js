@@ -7,7 +7,7 @@
         ['dd_refresh_rate_option', 'Refresh rate', ['disabled', 'auto', 'manual', 'prefer_highest']],
         ['dd_manual_refresh_rate', 'Manual refresh rate', null],
         ['dd_hdr_option', 'Display HDR', ['disabled', 'auto']],
-        ['dd_hdr_request_override', 'HDR request', ['follow_client', 'force_on', 'force_off']],
+        ['dd_hdr_request_override', 'HDR request', ['auto', 'force_on', 'force_off']],
         ['adapter_name', 'Graphics adapter', null],
         ['virtual_display_mode', 'Virtual display mode', ['disabled', 'per_client', 'shared']],
         ['virtual_display_layout', 'Virtual display layout', ['exclusive', 'extended', 'extended_primary', 'extended_isolated', 'extended_primary_isolated']],
@@ -36,7 +36,7 @@
             prefer10Bit: entry.config_overrides?.prefer_10bit_sdr ?? null, policy };
     };
     const hostValues = reply => ({ output: reply.configured_output_name ?? '', policy: sparse(reply.configured_display_policy) });
-    const mount = (container, sdk) => {
+    const mount = (container, sdk, everyday = false) => {
         const application = sdk.application;
         const canRead = sdk.canCall(application ? 'app_read' : 'host_read');
         const canWrite = sdk.canCall(application ? 'app_update' : 'host_update');
@@ -47,8 +47,16 @@
         const help = document.createElement('p');
         help.textContent = 'Choose display preparation for the next stream. Saving settings does not change an active display lease or restart a stream.';
         const rows = document.createElement('div');
-        container.replaceChildren(title, help, rows, status);
-        const controls = [], reflectors = [];
+        const more = document.createElement('details');
+        const summary = document.createElement('summary');
+        summary.textContent = 'More display settings';
+        more.append(summary);
+        let target = rows;
+        if (everyday)
+            container.replaceChildren(rows, more, status);
+        else
+            container.replaceChildren(title, help, rows, status);
+        const controls = [], reflectors = [], visibility = [];
         let baseline, draft, saving = false, generation = 0, timer, disposed = false, policyText, invalidPolicy = false;
         const dirty = () => draft && !same(draft, baseline);
         const updateDirty = () => sdk.setDirty(!!dirty() || invalidPolicy);
@@ -145,9 +153,9 @@
                 }
             }
         }
-        const add = control => { controls.push(control); rows.append(control.element); return control; };
-        const select = (name, choices, get, set) => {
-            const control = add(sdk.ui.select({ label: name, choices: [{ value: 'inherit', label: application ? 'Inherit' : 'Default' }, ...choices.map(value => ({ value, label: label(value) }))], value: get() || 'inherit', disabled: !canWrite,
+        const add = control => { controls.push(control); target.append(control.element); return control; };
+        const select = (name, choices, get, set, labels = {}) => {
+            const control = add(sdk.ui.select({ label: name, choices: [{ value: 'inherit', label: application ? 'Inherit' : 'Default' }, ...choices.map(value => ({ value, label: labels[value] ?? label(value) }))], value: get() || 'inherit', disabled: !canWrite,
                 onChange: value => changed(() => { set(value === 'inherit' ? '' : value); if (policyText)
                     policyText.setValue(JSON.stringify(draft.policy, null, 2)); }) }));
             reflectors.push(() => control.setValue(get() || 'inherit'));
@@ -173,6 +181,7 @@
             draft = values(reply);
             baseline = clone(draft);
             const managed = application && reply.entry.launch?.kind === 'playnite';
+            if (everyday) target = more;
             if (!managed) {
                 text('Display output', () => draft.output, value => { draft.output = value; });
                 if (application) {
@@ -182,16 +191,27 @@
                     select('Virtual display layout', ['exclusive', 'extended', 'extended_primary', 'extended_isolated', 'extended_primary_isolated'], () => draft.layout, value => { draft.layout = value; });
                 }
             }
+            const common = {
+                virtual_display_mode: { disabled: 'Physical display', per_client: 'Virtual display per client', shared: 'Shared virtual display' },
+                dd_configuration_option: { disabled: 'Leave displays as they are' },
+                dd_resolution_option: { auto: 'Match the client', disabled: 'Keep current resolution', manual: 'Custom resolution' },
+                dd_refresh_rate_option: { auto: 'Match the client', disabled: 'Keep current refresh rate', manual: 'Custom refresh rate' },
+                dd_hdr_option: { auto: 'Match the stream', disabled: 'Keep current HDR state' },
+            };
             for (const [id, name, choices] of fields) {
                 // App top-level mode/layout are distinct from provider display policy.
                 if (application && !managed && ['virtual_display_mode', 'virtual_display_layout'].includes(id))
                     continue;
-                const set = value => { if (value === '')
-                    delete draft.policy[id];
-                else
-                    draft.policy[id] = value; };
+                const manualMode = id === 'dd_manual_resolution' ? 'dd_resolution_option'
+                    : id === 'dd_manual_refresh_rate' ? 'dd_refresh_rate_option' : undefined;
+                target = everyday && !common[id] && !manualMode ? more : rows;
+                const set = value => {
+                    if (value === '') delete draft.policy[id];
+                    else draft.policy[id] = value;
+                    for (const update of visibility) update();
+                };
                 if (Array.isArray(choices))
-                    select(name, choices, () => draft.policy[id], set);
+                    select(name, choices, () => draft.policy[id], set, everyday ? common[id] : undefined);
                 else if (choices === 'number') {
                     const control = add(sdk.ui.numberField({ label: name, value: Number(draft.policy[id] ?? 100), minimum: 0, maximum: 65535, step: 1, disabled: !canWrite, onChange: value => changed(() => { draft.policy[id] = value; policyText?.setValue(JSON.stringify(draft.policy, null, 2)); }) }));
                     reflectors.push(() => control.setValue(Number(draft.policy[id] ?? 100)));
@@ -200,9 +220,17 @@
                         else
                             draft.policy[id] = control.value(); policyText?.setValue(JSON.stringify(draft.policy, null, 2)); }) }));
                 }
-                else
-                    text(name, () => draft.policy[id], set);
+                else {
+                    const control = text(name, () => draft.policy[id], set);
+                    if (everyday && manualMode) {
+                        const update = () => { control.element.hidden = draft.policy[manualMode] !== 'manual'; };
+                        update();
+                        visibility.push(update);
+                        reflectors.push(update);
+                    }
+                }
             }
+            target = everyday ? more : rows;
             policyText = add(sdk.ui.textField({ label: 'Advanced display policy (JSON)', value: JSON.stringify(draft.policy, null, 2), maxLength: 32768, disabled: !canWrite, onChange: value => {
                     try {
                         const parsed = JSON.parse(value || '{}');
@@ -231,5 +259,5 @@
         sdk.signal.addEventListener('abort', dispose, { once: true });
         return dispose;
     };
-    window.AmaterasuExtensions.v1.register('display', { title: 'Display', mount, mountSettings: mount, mountApplication: mount });
+    window.AmaterasuExtensions.v1.register('display', { title: 'Display', mount, mountSettings: (container, sdk) => mount(container, sdk, true), mountApplication: mount });
 })();
